@@ -26,13 +26,10 @@ HOOK_SECRET = os.environ.get("HOOK_SECRET", "sandow").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
 MSK = timezone(timedelta(hours=3))
 
-# 1С:Фитнес клуб. Пока не выдан ключ приложения, отправка молча выключена —
-# заявка всё равно уходит в группу, менеджер её видит.
-ONEC_URL = os.environ.get("ONEC_URL", "https://app.1c.fitness/fitnessapi/hs/api/v3").rstrip("/")
-ONEC_LOGIN = os.environ.get("ONEC_LOGIN", "").strip()
-ONEC_PASSWORD = os.environ.get("ONEC_PASSWORD", "").strip()
-ONEC_APIKEY = os.environ.get("ONEC_APIKEY", "").strip()
-ONEC_CLUB_ID = os.environ.get("ONEC_CLUB_ID", "").strip()
+# 1С:Фитнес клуб принимает заявки тем же вебхуком, что и формы Тильды: обычная
+# форма, не JSON. Адрес содержит секретный идентификатор, поэтому живёт только
+# в переменных сервиса. Пусто — отправка выключена, заявка всё равно идёт в группу.
+ONEC_WEBHOOK = os.environ.get("ONEC_WEBHOOK", "").strip()
 ONEC_SOURCE = os.environ.get("ONEC_SOURCE", "Telegram-бот, сайт").strip()
 
 app = Flask(__name__)
@@ -166,38 +163,33 @@ def step_combat(chat_id, message_id=None):
 # ------------------------------------------------------------------- заявка
 
 def send_to_1c(user, phone, goal, direction):
-    """Создаёт заявку в 1С:Фитнес клуб. Возвращает текст для приписки к заявке.
+    """Заводит заявку в 1С:Фитнес клуб. Возвращает приписку к сообщению в группе.
 
-    Источник пишется в marketing.source — по нему в 1С видно, откуда пришёл
-    человек. Ошибку не глотаем: менеджер должен знать, что в 1С записи нет.
+    Данные уходят формой — тем же способом, каким шлёт Тильда. JSON приёмник
+    не принимает. Ошибку не глотаем: менеджер должен знать, что записи в 1С нет.
     """
-    if not (ONEC_APIKEY and ONEC_LOGIN and ONEC_PASSWORD):
+    if not ONEC_WEBHOOK:
         return ""
 
-    body = {
-        "phone": re.sub(r"\D", "", phone or ""),
-        "name": (user.get("first_name") or "").strip(),
-        "last_name": (user.get("last_name") or "").strip(),
-        "comment": (f"Заявка из Telegram-бота. Подарок: {GIFT}. "
+    name = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x).strip()
+    data = {
+        "Name": name or "Без имени",
+        "Phone": re.sub(r"\D", "", phone or ""),
+        "Comment": (f"Заявка из Telegram-бота. Подарок: {GIFT}. "
                     f"Задача: {GOALS.get(goal, 'не указана')}. "
                     f"Начнёт с: {DIRS.get(direction, DIRS['any'])[0]}."),
-        "marketing": {
-            "source": ONEC_SOURCE,
-            "utm_source": "telegram",
-            "utm_medium": "bot",
-            "utm_campaign": "72h",
-        },
+        "source": ONEC_SOURCE,
+        "utm_source": "telegram",
+        "utm_medium": "bot",
+        "utm_campaign": "72h",
+        "formname": "Telegram-бот сайта",
+        "formid": "sandow_lead_bot",
+        "tranid": f"tg-{user.get('id')}-{int(time.time())}",
     }
-    if ONEC_CLUB_ID:
-        body["club_id"] = ONEC_CLUB_ID
-
     try:
-        r = requests.post(f"{ONEC_URL}/lead/", json=body,
-                          auth=(ONEC_LOGIN, ONEC_PASSWORD),
-                          headers={"apikey": ONEC_APIKEY}, timeout=25)
-        if r.status_code == 200 and (r.json() or {}).get("result"):
-            lead_id = ((r.json() or {}).get("data") or {}).get("lead_id", "")
-            print(f"[1c] заявка создана: {lead_id}", flush=True)
+        r = requests.post(ONEC_WEBHOOK, data=data, timeout=25)
+        if r.status_code == 200:
+            print(f"[1c] заявка принята: {r.text[:80]}", flush=True)
             return "\n\n✅ Заведено в 1С"
         print(f"[1c] отказ {r.status_code}: {r.text[:200]}", flush=True)
         return f"\n\n⚠️ В 1С не попало (код {r.status_code}) — занесите вручную"
