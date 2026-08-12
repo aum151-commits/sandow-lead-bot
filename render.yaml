@@ -1,0 +1,18 @@
+# Лид-бот «Сандов Фитнес» на Render. Секреты (sync: false) задаются в панели
+# или через API и в репозиторий не попадают.
+services:
+  - type: web
+    name: sandow-lead-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bot:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 30
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ORDERS_CHAT_ID
+        sync: false
+      - key: HOOK_SECRET
+        sync: false
