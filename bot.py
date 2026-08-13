@@ -60,8 +60,35 @@ LOCK = threading.Lock()
 CLUB = "Нижегородская ул., 29/33, стр. 3"
 PHONE = "+7 (495) 795-69-57"
 GIFT = "72 часа в клубе"
-SCHEDULE_URL = "https://t.me/sandowfit"
+SCHEDULE_CHANNEL = "https://t.me/sandowfit"
 FREEZE_URL = "https://sandowfitness.ru/zamorozka"
+
+# Кнопка «Расписание» ведёт не просто в канал, а на последний пост с
+# расписанием: в ленте канала сверху бывают отмены занятий, и человек по
+# кнопке «расписание» попадал на сообщение об отмене. Свежий пост ищем по
+# публичной веб-версии канала, ответ кэшируем на час.
+_SCHED = {"url": SCHEDULE_CHANNEL, "ts": 0}
+
+
+def schedule_url():
+    if time.time() - _SCHED["ts"] < 3600:
+        return _SCHED["url"]
+    try:
+        h = requests.get("https://t.me/s/sandowfit", timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"}).text
+        best = None
+        for m in re.finditer(
+                r'data-post="sandowfit/(\d+)".*?class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
+                h, re.S):
+            txt = re.sub(r"<[^>]+>", " ", m.group(2))
+            if re.search(r"расписани", txt, re.I) and "отмен" not in txt.lower():
+                best = m.group(1)
+        if best:
+            _SCHED["url"] = f"{SCHEDULE_CHANNEL}/{best}"
+    except Exception as exc:
+        print(f"[sched] {exc}", flush=True)   # не вышло — остаётся ссылка на канал
+    _SCHED["ts"] = time.time()
+    return _SCHED["url"]
 
 GOALS = {
     "strength": "Набрать форму и силу",
@@ -210,7 +237,7 @@ def step_member_menu(chat_id, message_id=None, greet=True):
             "Если нужен живой человек — жмите «Написать менеджеру», "
             "переписка пойдёт прямо здесь.") if greet else "Чем ещё помочь?"
     markup = kb_mixed([
-        [("📅 Расписание групповых", "url:" + SCHEDULE_URL)],
+        [("📅 Расписание групповых", "url:" + schedule_url())],
         [("❄️ Заморозка абонемента", "url:" + FREEZE_URL)],
         [("💬 Написать менеджеру", "bridge")],
         [("📱 Оставить номер для связи", "member_phone")],
