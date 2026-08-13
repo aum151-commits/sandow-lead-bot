@@ -1,16 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-Лид-бот клуба «Сандов Фитнес».
+Бот клуба «Сандов Фитнес» — единая точка входа с сайта.
 
-Подарок — 72 часа в клубе (три дня подряд). Дальше два вопроса, цель и
-направление, и человек оставляет номер. Заявка падает в группу «Sandow заявки».
+Версия 2: бот различает две аудитории и ведёт их по-разному.
 
-Вводную тренировку бот не обещает: её дарит менеджер от себя во время звонка —
-это его козырь, и он не должен быть израсходован ботом.
+  • Новичок — как раньше: подарок 72 часа, два вопроса, номер, заявка
+    в группу «Sandow заявки» и в 1С.
+  • Действующий член клуба — меню без продажи: расписание, заморозка,
+    переписка с менеджером. Заявок в 1С не создаёт, менеджеров не дёргает.
 
-Работает через webhook: Telegram присылает обновление на /tg/<секрет>,
-бот отвечает и уходит спать до следующего сообщения.
+Мост с менеджером: сообщение клиента падает в рабочую группу с меткой
+#id<чат>. Менеджер отвечает реплаем на это сообщение — бот доставляет
+ответ клиенту. Ни телефоны, ни личные аккаунты менеджеров не светятся.
+
+База подписчиков: каждый, кто нажал /start, сохраняется в приватный
+репозиторий GitHub (data/tg_subscribers.json) — переживает перезапуски
+Render. По этой базе потом делаются сегментированные рассылки: боту
+разрешено писать первым каждому, кто его запустил.
+
+Работает через webhook: Telegram присылает обновление на /tg/<секрет>.
 """
+import base64
+import json
 import os
 import re
 import threading
@@ -32,6 +43,12 @@ MSK = timezone(timedelta(hours=3))
 ONEC_WEBHOOK = os.environ.get("ONEC_WEBHOOK", "").strip()
 ONEC_SOURCE = os.environ.get("ONEC_SOURCE", "Telegram-бот, сайт").strip()
 
+# База подписчиков — в приватном репозитории, потому что диск Render
+# стирается при каждом перезапуске. Пусто — база просто не ведётся.
+GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GH_REPO = os.environ.get("GITHUB_SUBSCRIBERS_REPO", "aum151-commits/sandow-automation").strip()
+GH_PATH = "data/tg_subscribers.json"
+
 app = Flask(__name__)
 
 # Состояние диалога живёт в памяти: он короткий, а ответы всё равно
@@ -43,6 +60,8 @@ LOCK = threading.Lock()
 CLUB = "Нижегородская ул., 29/33, стр. 3"
 PHONE = "+7 (495) 795-69-57"
 GIFT = "72 часа в клубе"
+SCHEDULE_URL = "https://t.me/sandowfit"
+FREEZE_URL = "https://sandowfitness.ru/zamorozka"
 
 GOALS = {
     "strength": "Набрать форму и силу",
@@ -76,30 +95,131 @@ def kb(rows):
     return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
 
 
+def kb_mixed(rows):
+    """Клавиатура, где кнопка может быть и ссылкой: ('текст', 'url:https://...')."""
+    out = []
+    for row in rows:
+        line = []
+        for t, d in row:
+            if d.startswith("url:"):
+                line.append({"text": t, "url": d[4:]})
+            else:
+                line.append({"text": t, "callback_data": d})
+        out.append(line)
+    return {"inline_keyboard": out}
+
+
 ASK_PHONE = {
     "keyboard": [[{"text": "📱 Отправить мой номер", "request_contact": True}]],
     "resize_keyboard": True, "one_time_keyboard": True,
 }
 
 
+# ------------------------------------------------------- база подписчиков
+
+def _gh_headers():
+    return {"Authorization": "Bearer " + GH_TOKEN,
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "sandow-lead-bot"}
+
+
+def save_subscriber(user, segment=None, phone=None):
+    """Дописывает или обновляет запись о человеке в базе подписчиков.
+
+    Работает в отдельном потоке: GitHub отвечает не мгновенно, а Telegram
+    ждёт ответ вебхука. Ошибка записи не должна ломать диалог.
+    """
+    if not GH_TOKEN:
+        return
+    threading.Thread(target=_save_subscriber, args=(dict(user), segment, phone),
+                     daemon=True).start()
+
+
+def _save_subscriber(user, segment, phone):
+    try:
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
+        if r.status_code == 200:
+            payload = r.json()
+            data = json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
+            sha = payload["sha"]
+        else:
+            data, sha = {}, None
+
+        key = str(user.get("id"))
+        rec = data.get(key, {})
+        rec.update({
+            "name": " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x),
+            "username": user.get("username", ""),
+            "last_seen": datetime.now(MSK).strftime("%Y-%m-%d %H:%M"),
+        })
+        rec.setdefault("first_seen", rec["last_seen"])
+        if segment:
+            rec["segment"] = segment
+        if phone:
+            rec["phone"] = phone
+        data[key] = rec
+
+        body = {"message": f"tg-бот: подписчик {key} ({rec.get('segment', '?')})",
+                "content": base64.b64encode(
+                    json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
+        if sha:
+            body["sha"] = sha
+        w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
+        if w.status_code not in (200, 201):
+            print(f"[base] запись не прошла: {w.status_code} {w.text[:120]}", flush=True)
+    except Exception as exc:
+        print(f"[base] {exc}", flush=True)
+
+
 # ---------------------------------------------------------------- шаги диалога
 
-def step_hello(chat_id, name):
-    hi = f"Здравствуйте, {name}!" if name else "Здравствуйте!"
+def step_gate(chat_id, name):
+    """Развилка: бот обслуживает и новых людей, и действующих членов клуба."""
+    api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+        text="Здравствуйте, это Сандов Фитнес на Нижегородской 🏆",
+        reply_markup=kb([
+            [("Хочу в клуб", "seg:new")],
+            [("Уже занимаюсь", "seg:member")],
+        ]))
+
+
+def step_hello(chat_id, message_id=None):
     text = (
-        f"{hi} Клуб «Сандов Фитнес» на Нижегородской.\n\n"
         "<b>Дарим 72 часа в клубе.</b> Это три дня один за другим — полный доступ: "
         "тренажёрный зал 1100 м², групповые программы по расписанию, финская сауна.\n\n"
         "За один визит клуб не оценишь: первый раз только смотришь, где что лежит. "
         "Три дня подряд — это уже режим: успеете позаниматься по-настоящему и понять, "
         "ваше это или нет. С какого дня начать, подберёте с менеджером."
     )
-    api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-        reply_markup=kb([
-            [("Забрать 72 часа", "go")],
-            [("Интересуют единоборства", "combat")],
-            [("У меня вопрос", "ask")],
-        ]))
+    markup = kb([
+        [("Забрать 72 часа", "go")],
+        [("Интересуют единоборства", "combat")],
+        [("У меня вопрос", "ask")],
+    ])
+    if message_id:
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=text, parse_mode="HTML", reply_markup=markup)
+    else:
+        api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
+
+
+def step_member_menu(chat_id, message_id=None, greet=True):
+    """Меню действующего члена клуба. Никаких заявок и продаж — только польза."""
+    text = ("Рад видеть своих! Чем помочь?\n\n"
+            "Если нужен живой человек — жмите «Написать менеджеру», "
+            "переписка пойдёт прямо здесь.") if greet else "Чем ещё помочь?"
+    markup = kb_mixed([
+        [("📅 Расписание групповых", "url:" + SCHEDULE_URL)],
+        [("❄️ Заморозка абонемента", "url:" + FREEZE_URL)],
+        [("💬 Написать менеджеру", "bridge")],
+        [("📱 Оставить номер для связи", "member_phone")],
+    ])
+    if message_id:
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=text, reply_markup=markup)
+    else:
+        api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
 
 
 def step_goal(chat_id, message_id):
@@ -131,7 +251,8 @@ def step_phone(chat_id, message_id, goal, direction):
               f"Записал: <b>{gname.lower()}</b>, начнёте с направления «{dname.lower()}».\n\n"
               "Менеджер позвонит, подберёт дни под ваш график и расскажет, что взять с собой."))
     api("sendMessage", chat_id=chat_id,
-        text="Куда звонить? Нажмите кнопку внизу или напишите номер сообщением.",
+        text="Куда звонить? Нажмите кнопку внизу или напишите номер сообщением.\n\n"
+             "Отправляя номер, вы соглашаетесь на обработку персональных данных.",
         reply_markup=ASK_PHONE)
 
 
@@ -158,6 +279,75 @@ def step_combat(chat_id, message_id=None):
     else:
         api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
     api("sendMessage", chat_id=chat_id, text="Куда звонить?", reply_markup=ASK_PHONE)
+
+
+# --------------------------------------------------------- мост с менеджером
+
+def bridge_on(chat_id, message_id=None):
+    with LOCK:
+        STATE.setdefault(chat_id, {})["bridge"] = True
+    text = ("Пишите — передам менеджеру, ответ придёт прямо сюда.\n"
+            "Когда закончите, нажмите «Завершить разговор».")
+    markup = kb([[("Завершить разговор", "bridge_off")]])
+    if message_id:
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=text, reply_markup=markup)
+    else:
+        api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
+
+
+def bridge_off(chat_id, message_id=None):
+    with LOCK:
+        st = STATE.get(chat_id)
+        if st:
+            st.pop("bridge", None)
+    seg = _segment(chat_id)
+    if message_id:
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text="Разговор завершён. Если что — я тут.")
+    if seg == "member":
+        step_member_menu(chat_id, greet=False)
+
+
+def bridge_to_group(chat_id, user, text):
+    """Сообщение клиента → рабочая группа. Метка #id — по ней вернётся ответ."""
+    who = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
+    uname = f"@{user['username']}" if user.get("username") else "без ника"
+    seg = "член клуба" if _segment(chat_id) == "member" else "новый"
+    api("sendMessage", chat_id=ORDERS_CHAT, parse_mode="HTML",
+        text=(f"💬 <b>СООБЩЕНИЕ ИЗ БОТА</b> ({seg})\n\n"
+              f"<b>{who}</b> · {uname}\n\n"
+              f"{text}\n\n"
+              f"#id{chat_id}\n"
+              "Ответьте реплаем на это сообщение — я передам."))
+    api("sendMessage", chat_id=chat_id, text="Передал менеджеру. Ответ придёт сюда.")
+
+
+BRIDGE_TAG = re.compile(r"#id(-?\d+)")
+
+
+def bridge_from_group(msg):
+    """Реплай менеджера в группе → клиенту. Работает только на реплаях к боту."""
+    reply = msg.get("reply_to_message") or {}
+    tag = BRIDGE_TAG.search(reply.get("text") or "")
+    if not tag:
+        return False
+    target = int(tag.group(1))
+    text = (msg.get("text") or "").strip()
+    if not text:
+        api("sendMessage", chat_id=msg["chat"]["id"],
+            reply_to_message_id=msg["message_id"],
+            text="Могу передать только текст — напишите словами.")
+        return True
+    api("sendMessage", chat_id=target, text=f"Менеджер клуба:\n\n{text}")
+    api("setMessageReaction", chat_id=msg["chat"]["id"],
+        message_id=msg["message_id"], reaction=[{"type": "emoji", "emoji": "👌"}])
+    return True
+
+
+def _segment(chat_id):
+    with LOCK:
+        return STATE.get(chat_id, {}).get("segment", "")
 
 
 # ------------------------------------------------------------------- заявка
@@ -307,7 +497,36 @@ def on_button(cq):
     data = cq.get("data", "")
     chat_id = cq["message"]["chat"]["id"]
     mid = cq["message"]["message_id"]
+    user = cq.get("from", {})
     api("answerCallbackQuery", callback_query_id=cq["id"])
+
+    if data == "seg:new":
+        with LOCK:
+            STATE.setdefault(chat_id, {})["segment"] = "new"
+        save_subscriber(user, segment="new")
+        return step_hello(chat_id, mid)
+
+    if data == "seg:member":
+        with LOCK:
+            STATE.setdefault(chat_id, {})["segment"] = "member"
+        save_subscriber(user, segment="member")
+        return step_member_menu(chat_id, mid)
+
+    if data == "bridge":
+        return bridge_on(chat_id, mid)
+
+    if data == "bridge_off":
+        return bridge_off(chat_id, mid)
+
+    if data == "member_phone":
+        with LOCK:
+            STATE.setdefault(chat_id, {})["member_phone"] = True
+        api("editMessageText", chat_id=chat_id, message_id=mid,
+            text="Нажмите кнопку внизу — я сохраню номер, чтобы находить вас "
+                 "в системе клуба и присылать только то, что касается вас.\n\n"
+                 "Отправляя номер, вы соглашаетесь на обработку персональных данных.")
+        return api("sendMessage", chat_id=chat_id, text="Одним нажатием:",
+                   reply_markup=ASK_PHONE)
 
     if data == "go":
         return step_goal(chat_id, mid)
@@ -343,10 +562,11 @@ def on_message(msg):
     user = msg.get("from", {})
     text = (msg.get("text") or "").strip()
 
-    # Бот состоит в рабочей группе, чтобы отправлять туда заявки. Отвечать
-    # там он не должен: на любое сообщение коллег он предлагал подарок
-    # и засорял группу. Диалог ведём только в личных чатах.
+    # В группах бот молчит — с одним исключением: реплай менеджера на
+    # сообщение с меткой #id он доставляет клиенту.
     if msg["chat"].get("type") != "private":
+        if msg.get("reply_to_message"):
+            bridge_from_group(msg)
         return
 
     if msg.get("contact"):
@@ -356,12 +576,19 @@ def on_message(msg):
     if text.startswith("/start"):
         with LOCK:
             STATE.pop(chat_id, None)
-        return step_hello(chat_id, user.get("first_name"))
+        save_subscriber(user)
+        return step_gate(chat_id, user.get("first_name"))
 
     if text.startswith("/help"):
         return api("sendMessage", chat_id=chat_id,
                    text=f"Клуб «Сандов Фитнес», {CLUB}. Телефон {PHONE}.\n"
-                        "Наберите /start, чтобы забрать 72 часа в клубе.")
+                        "Наберите /start — помогу и с первым визитом, и по клубу.")
+
+    # мост открыт — любые слова уходят менеджеру
+    with LOCK:
+        in_bridge = STATE.get(chat_id, {}).get("bridge")
+    if in_bridge and text:
+        return bridge_to_group(chat_id, user, text)
 
     # человек прислал номер текстом
     if PHONE_RE.fullmatch(text or "") or len(re.sub(r"\D", "", text or "")) >= 10:
@@ -372,22 +599,47 @@ def on_message(msg):
                    text="Не разобрал номер. Пришлите в формате +7 999 123-45-67 "
                         "или нажмите кнопку «Отправить мой номер».")
 
+    # член клуба написал текстом без моста: не продаём, зовём в диалог
+    if _segment(chat_id) == "member":
+        answer = faq_answer(text)
+        if answer:
+            return api("sendMessage", chat_id=chat_id, text=answer,
+                       reply_markup=kb([[("💬 Написать менеджеру", "bridge")]]))
+        return api("sendMessage", chat_id=chat_id,
+                   text="Передать это менеджеру? Нажмите кнопку — и переписка "
+                        "пойдёт прямо здесь.",
+                   reply_markup=kb([[("💬 Написать менеджеру", "bridge")],
+                                    [("Показать меню", "seg:member")]]))
+
     answer = faq_answer(text)
     if answer:
         return api("sendMessage", chat_id=chat_id, text=answer + TAIL,
-                   reply_markup=kb([[("Забрать 72 часа", "go")]]))
+                   reply_markup=kb([[("Забрать 72 часа", "go")],
+                                    [("💬 Написать менеджеру", "bridge")]]))
 
     api("sendMessage", chat_id=chat_id, parse_mode="HTML",
         text="<b>Дарим 72 часа в клубе</b> — три дня один за другим, полный доступ: "
              "зал, групповые, сауна.\n\nДва вопроса — и менеджер подберёт дни.",
         reply_markup=kb([[("Забрать 72 часа", "go")],
-                         [("Интересуют единоборства", "combat")]]))
+                         [("Интересуют единоборства", "combat")],
+                         [("Я член клуба", "seg:member")]]))
 
 
 def finish(chat_id, user, phone):
     if not phone:
         return api("sendMessage", chat_id=chat_id,
                    text="Не разобрал номер. Пришлите в формате +7 999 123-45-67.")
+
+    # член клуба делится номером для связи — это не заявка: в 1С не шлём,
+    # менеджеров не дёргаем, просто запоминаем в базе
+    with LOCK:
+        member_phone = STATE.get(chat_id, {}).pop("member_phone", False)
+    if member_phone or _segment(chat_id) == "member":
+        save_subscriber(user, segment="member", phone=phone)
+        return api("sendMessage", chat_id=chat_id,
+                   text="Сохранил. Теперь буду присылать только то, что касается вас.",
+                   reply_markup={"remove_keyboard": True})
+
     with LOCK:
         st = STATE.get(chat_id, {})
     goal, direction = st.get("goal", "keep"), st.get("dir", "any")
@@ -396,15 +648,18 @@ def finish(chat_id, user, phone):
                    text="Ваш номер уже у менеджера — он позвонит. "
                         f"Если срочно, наберите нас: {PHONE}",
                    reply_markup={"remove_keyboard": True})
+    save_subscriber(user, segment="new", phone=phone)
     send_lead(user, phone, goal, direction)
     step_done(chat_id, user.get("first_name"))
     with LOCK:
-        STATE.pop(chat_id, None)
+        st = STATE.get(chat_id, {})
+        seg = st.get("segment")
+        STATE[chat_id] = {"segment": seg} if seg else {}
 
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-08-12-1c-ready"
+VERSION = "2026-08-13-v2-members-bridge"
 
 
 @app.route("/health")
