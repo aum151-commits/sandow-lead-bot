@@ -249,9 +249,14 @@ def step_member_menu(chat_id, message_id=None, greet=True):
         api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
 
 
-def step_goal(chat_id, message_id):
+def step_goal(chat_id, message_id, intro=False):
+    # Квиз вместо меню: по опыту работающих ботов человеку легче отвечать
+    # о себе, чем выбирать услугу из каталога. Подарок вручается в конце —
+    # как награда за два ответа, а не как приманка с порога.
+    text = ("Подберу вам первые визиты — всего два вопроса.\n\nКакая задача?"
+            if intro else "Какая задача?")
     api("editMessageText", chat_id=chat_id, message_id=message_id,
-        text="Какая задача?", reply_markup=kb([
+        text=text, reply_markup=kb([
             [("Набрать форму и силу", "g:strength")],
             [("Похудеть, привести тонус", "g:shape")],
             [("Держать себя в форме", "g:keep")],
@@ -276,6 +281,8 @@ def step_phone(chat_id, message_id, goal, direction):
         parse_mode="HTML",
         text=(f"{dtext}\n\n"
               f"Записал: <b>{gname.lower()}</b>, начнёте с направления «{dname.lower()}».\n\n"
+              "Под вашу задачу — <b>дарим 72 часа в клубе</b>: три дня один за другим, "
+              "полный доступ. Зал 1100 м², групповые по расписанию, финская сауна.\n\n"
               "Менеджер позвонит, подберёт дни под ваш график и расскажет, что взять с собой."))
     api("sendMessage", chat_id=chat_id,
         text="Куда звонить? Нажмите кнопку внизу или напишите номер сообщением.\n\n"
@@ -465,7 +472,7 @@ FAQ = [
      "Ещё форма и обувь, остальное наше."),
 ]
 
-TAIL = "\n\nЗаберёте 72 часа? Оставьте номер — менеджер позвонит и подберёт дни."
+TAIL = "\n\nХотите попробовать? Подберу первые визиты — всего два вопроса."
 
 
 def faq_answer(text):
@@ -531,7 +538,7 @@ def on_button(cq):
         with LOCK:
             STATE.setdefault(chat_id, {})["segment"] = "new"
         save_subscriber(user, segment="new")
-        return step_hello(chat_id, mid)
+        return step_goal(chat_id, mid, intro=True)
 
     if data == "seg:member":
         with LOCK:
@@ -641,14 +648,14 @@ def on_message(msg):
     answer = faq_answer(text)
     if answer:
         return api("sendMessage", chat_id=chat_id, text=answer + TAIL,
-                   reply_markup=kb([[("Забрать 72 часа", "go")],
+                   reply_markup=kb([[("Подобрать первые визиты", "go")],
                                     [("💬 Написать менеджеру", "bridge")]]))
 
-    api("sendMessage", chat_id=chat_id, parse_mode="HTML",
-        text="<b>Дарим 72 часа в клубе</b> — три дня один за другим, полный доступ: "
-             "зал, групповые, сауна.\n\nДва вопроса — и менеджер подберёт дни.",
-        reply_markup=kb([[("Забрать 72 часа", "go")],
-                         [("Интересуют единоборства", "combat")],
+    api("sendMessage", chat_id=chat_id,
+        text="Подберу вам первые визиты — всего два вопроса. "
+             "Или спросите словами, отвечу.",
+        reply_markup=kb([[("Подобрать первые визиты", "go")],
+                         [("💬 Написать менеджеру", "bridge")],
                          [("Я член клуба", "seg:member")]]))
 
 
