@@ -277,16 +277,19 @@ def step_dir(chat_id, message_id, goal):
 def step_phone(chat_id, message_id, goal, direction):
     gname = GOALS.get(goal, "")
     dname, dtext = DIRS.get(direction, DIRS["any"])
+    # Старое сообщение квиза сжимаем в короткую бирку, а финал шлём ОДНИМ
+    # сообщением: Telegram проматывает чат к последнему, и когда финал был
+    # разбит надвое, человек видел только хвост без подарка.
     api("editMessageText", chat_id=chat_id, message_id=message_id,
         parse_mode="HTML",
-        text=(f"{dtext}\n\n"
-              f"Записал: <b>{gname.lower()}</b>, начнёте с направления «{dname.lower()}».\n\n"
-              "Под вашу задачу — <b>дарим 72 часа в клубе</b>: три дня один за другим, "
-              "полный доступ. Зал 1100 м², групповые по расписанию, финская сауна.\n\n"
-              "Менеджер позвонит, подберёт дни под ваш график и расскажет, что взять с собой."))
-    api("sendMessage", chat_id=chat_id,
-        text="Куда звонить? Нажмите кнопку внизу или напишите номер сообщением.\n\n"
-             "Отправляя номер, вы соглашаетесь на обработку персональных данных.",
+        text=f"Записал ✅ Задача — {gname.lower()}, старт — «{dname.lower()}».")
+    api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+        text=("🎁 <b>Дарим вам 72 часа в клубе</b> — три дня один за другим, "
+              "полный доступ: зал 1100 м², групповые по расписанию, финская сауна.\n\n"
+              f"{dtext}\n\n"
+              "Менеджер позвонит, подберёт дни под ваш график и расскажет, что взять "
+              "с собой. Куда звонить? Нажмите кнопку внизу или напишите номер.\n\n"
+              "Отправляя номер, вы соглашаетесь на обработку персональных данных."),
         reply_markup=ASK_PHONE)
 
 
@@ -302,17 +305,14 @@ def step_done(chat_id, name):
 
 
 def step_combat(chat_id, message_id=None):
-    text = ("Бойцовский клуб 500 м², бокс и кикбоксинг. <b>Первая тренировка по боксу "
-            "бесплатная</b>, и 72 часа в клубе тоже ваши — зал и сауна входят.\n\n"
-            "Оставьте номер — менеджер скажет, когда ближайшая тренировка и что взять.")
+    # одно сообщение, подарок первым — как и в основном финале
     with LOCK:
         STATE.setdefault(chat_id, {}).update({"goal": "stress", "dir": "fight"})
-    if message_id:
-        api("editMessageText", chat_id=chat_id, message_id=message_id,
-            text=text, parse_mode="HTML")
-    else:
-        api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
-    api("sendMessage", chat_id=chat_id, text="Куда звонить?", reply_markup=ASK_PHONE)
+    api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+        text=("🎁 <b>Первая тренировка по боксу — бесплатная</b>, и 72 часа в клубе "
+              "тоже ваши: бойцовский клуб 500 м², зал и сауна входят.\n\n"
+              "Оставьте номер — менеджер скажет, когда ближайшая тренировка и что взять."),
+        reply_markup=ASK_PHONE)
 
 
 # --------------------------------------------------------- мост с менеджером
