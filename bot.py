@@ -597,6 +597,13 @@ def on_message(msg):
             bridge_from_group(msg)
         return
 
+    # Ответ менеджера реплаем на карточку с меткой #id. Обычно карточки живут
+    # в рабочей группе, но при тестовом режиме ORDERS_CHAT — личный чат, и
+    # реплаи должны работать и там.
+    if str(chat_id) == str(ORDERS_CHAT) and msg.get("reply_to_message"):
+        if bridge_from_group(msg):
+            return
+
     if msg.get("contact"):
         phone = clean_phone(msg["contact"].get("phone_number"))
         return finish(chat_id, user, phone)
