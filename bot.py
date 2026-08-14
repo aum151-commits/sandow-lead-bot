@@ -481,7 +481,17 @@ def bridge_to_group(chat_id, user, text, message_id=None):
     uname = f"@{user['username']}" if user.get("username") else "без ника"
     seg = "член клуба" if _segment(chat_id) == "member" else "новый"
     with LOCK:
-        STATE.setdefault(chat_id, {}).setdefault("dlg", []).append(("Клиент", text))
+        st = STATE.setdefault(chat_id, {})
+        st.setdefault("dlg", []).append(("Клиент", text))
+        st["dlg_ts"] = time.time()
+    # автоархив: если разговор затих на 4 часа — сам уезжает в карточку 1С,
+    # не дожидаясь кнопки «Завершить разговор»
+    def _auto(ts_snapshot=STATE[chat_id]["dlg_ts"]):
+        with LOCK:
+            still = STATE.get(chat_id, {}).get("dlg_ts") == ts_snapshot
+        if still:
+            archive_dialog(chat_id)
+    threading.Timer(14400, _auto).start()
     phone = lookup_phone(user.get("id"))
     pline = (f"<b>Телефон:</b> <code>{phone}</code> — продолжить диалог из 1С\n"
              if phone else "Телефон не оставлял — отвечайте реплаем здесь\n")
