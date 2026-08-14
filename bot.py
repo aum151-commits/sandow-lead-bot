@@ -307,7 +307,7 @@ def step_done(chat_id, name):
               "Возьмите, пожалуйста, с собой паспорт, форму и обувь. Остальное наше: полотенца, вода, шкафчик.\n\n"
               f"{CLUB}\n"
               f"Телефон клуба: {PHONE}\n\n"
-              "Кстати, как к вам обращаться? Напишите — передам менеджеру."),
+              "Кстати, как к вам обращаться? 🙂"),
         reply_markup={"remove_keyboard": True})
 
 
@@ -663,7 +663,7 @@ def on_message(msg):
         else:
             api("sendMessage", chat_id=ORDERS_CHAT, text=note, parse_mode="HTML")
         return api("sendMessage", chat_id=chat_id,
-                   text=f"Приятно познакомиться, {name}! Передал менеджеру 👍")
+                   text=f"Приятно познакомиться, {name}! 🤝 До встречи в клубе.")
 
     # человек прислал номер текстом
     if PHONE_RE.fullmatch(text or "") or len(re.sub(r"\D", "", text or "")) >= 10:
