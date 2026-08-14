@@ -353,17 +353,40 @@ def bridge_off(chat_id, message_id=None):
         step_member_menu(chat_id, greet=False)
 
 
+def lookup_phone(user_id):
+    """Телефон из базы подписчиков — чтобы менеджер сразу нашёл клиента в 1С."""
+    if not GH_TOKEN:
+        return ""
+    try:
+        r = requests.get(f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}",
+                         headers=_gh_headers(), timeout=15)
+        if r.status_code != 200:
+            return ""
+        data = json.loads(base64.b64decode(r.json()["content"]).decode("utf-8"))
+        return data.get(str(user_id), {}).get("phone", "")
+    except Exception:
+        return ""
+
+
 def bridge_to_group(chat_id, user, text, message_id=None):
-    """Сообщение клиента → рабочая группа. Метка #id — по ней вернётся ответ."""
+    """Сообщение клиента → рабочая группа. Метка #id — по ней вернётся ответ.
+
+    Длинные диалоги менеджер ведёт из 1С по номеру (Телеграм Премиум) — здесь
+    только первое касание для контроля. Телефон в карточке — ключ к клиенту в 1С.
+    """
     who = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
     uname = f"@{user['username']}" if user.get("username") else "без ника"
     seg = "член клуба" if _segment(chat_id) == "member" else "новый"
+    phone = lookup_phone(user.get("id"))
+    pline = (f"<b>Телефон:</b> <code>{phone}</code> — продолжить диалог из 1С\n"
+             if phone else "Телефон не оставлял — отвечайте реплаем здесь\n")
     api("sendMessage", chat_id=BRIDGE_CHAT, parse_mode="HTML",
         text=(f"💬 <b>СООБЩЕНИЕ ИЗ БОТА</b> ({seg})\n\n"
-              f"<b>{who}</b> · {uname}\n\n"
+              f"<b>{who}</b> · {uname}\n"
+              f"{pline}\n"
               f"{text}\n\n"
               f"#id{chat_id}\n"
-              "Ответьте реплаем на это сообщение — я передам."))
+              "Ответ реплаем на это сообщение уйдёт клиенту в бот."))
     # Подтверждение не пишем: при входе в режим бот уже сказал «передам,
     # ответ придёт сюда». Достаточно тихой реакции на сообщении клиента.
     if message_id:
