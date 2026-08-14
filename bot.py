@@ -244,10 +244,15 @@ def step_hello(chat_id, message_id=None):
 def step_member_menu(chat_id, message_id=None, greet=True):
     """Меню действующего члена клуба. Никаких заявок и продаж — только польза."""
     text = "Рад видеть своих! Чем помочь?" if greet else "Чем ещё помочь?"
+    # «Написать менеджеру» — прямая ссылка в чат клуба (1С): один тап, без
+    # промежуточных экранов. Отметка в группу при этом не шлётся — обращение
+    # видно во вкладке мессенджера 1С. Без MANAGER_TG_URL — встроенный мост.
+    manager_btn = (("💬 Написать менеджеру", "url:" + MANAGER_TG_URL)
+                   if MANAGER_TG_URL else ("💬 Написать менеджеру", "bridge"))
     markup = kb_mixed([
         [("📅 Расписание групповых программ", "url:" + schedule_url())],
         [("❄️ Заморозка абонемента", "url:" + FREEZE_URL)],
-        [("💬 Написать менеджеру", "bridge")],
+        [manager_btn],
         [("📱 Оставить номер для связи", "member_phone")],
     ])
     if message_id:
@@ -801,23 +806,23 @@ def on_message(msg):
         answer = faq_answer(text)
         if answer:
             return api("sendMessage", chat_id=chat_id, text=answer,
-                       reply_markup=kb([[("💬 Написать менеджеру", "bridge")]]))
+                       reply_markup=kb_mixed([[("💬 Написать менеджеру", ("url:" + MANAGER_TG_URL) if MANAGER_TG_URL else "bridge")]]))
         return api("sendMessage", chat_id=chat_id,
                    text="Передать это менеджеру?",
-                   reply_markup=kb([[("💬 Написать менеджеру", "bridge")],
+                   reply_markup=kb_mixed([[("💬 Написать менеджеру", ("url:" + MANAGER_TG_URL) if MANAGER_TG_URL else "bridge")],
                                     [("Показать меню", "seg:member")]]))
 
     answer = faq_answer(text)
     if answer:
         return api("sendMessage", chat_id=chat_id, text=answer + TAIL,
-                   reply_markup=kb([[("Подобрать первые визиты", "go")],
-                                    [("💬 Написать менеджеру", "bridge")]]))
+                   reply_markup=kb_mixed([[("Подобрать первые визиты", "go")],
+                                    [("💬 Написать менеджеру", ("url:" + MANAGER_TG_URL) if MANAGER_TG_URL else "bridge")]]))
 
     api("sendMessage", chat_id=chat_id,
         text="Подберу вам первые визиты — всего два вопроса. "
              "Или спросите словами, отвечу.",
-        reply_markup=kb([[("Подобрать первые визиты", "go")],
-                         [("💬 Написать менеджеру", "bridge")],
+        reply_markup=kb_mixed([[("Подобрать первые визиты", "go")],
+                         [("💬 Написать менеджеру", ("url:" + MANAGER_TG_URL) if MANAGER_TG_URL else "bridge")],
                          [("Я член клуба", "seg:member")]]))
 
 
