@@ -36,6 +36,11 @@ ORDERS_CHAT = os.environ.get("ORDERS_CHAT_ID", "").strip()
 # Переписка с клиентами идёт в отдельную группу, чтобы не засорять заявки.
 # Пока переменная не задана — падает туда же, куда заявки (ничего не теряется).
 BRIDGE_CHAT = os.environ.get("BRIDGE_CHAT_ID", "").strip() or ORDERS_CHAT
+# Ссылка на Telegram, подключённый к 1С (Телеграм Премиум). Когда задана,
+# кнопка «Написать менеджеру» ведёт клиента прямо туда: переписка рождается
+# в родном канале 1С — видна во вкладке мессенджера и в карточке клиента.
+# Пока пусто — работает встроенный мост через группу.
+MANAGER_TG_URL = os.environ.get("MANAGER_TG_URL", "").strip()
 HOOK_SECRET = os.environ.get("HOOK_SECRET", "sandow").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
 MSK = timezone(timedelta(hours=3))
@@ -327,7 +332,30 @@ def step_combat(chat_id, message_id=None):
 
 # --------------------------------------------------------- мост с менеджером
 
-def bridge_on(chat_id, message_id=None):
+def bridge_on(chat_id, message_id=None, user=None):
+    # Подключён Telegram клуба (интеграция с 1С): клиента отправляем туда —
+    # переписка рождается во вкладке мессенджера 1С и в карточке клиента.
+    # Здесь остаётся только отметка в группу заявок для контроля.
+    if MANAGER_TG_URL:
+        u = user or {}
+        who = " ".join(x for x in [u.get("first_name"), u.get("last_name")] if x) or "без имени"
+        uname = f"@{u['username']}" if u.get("username") else "без ника"
+        seg = "член клуба" if _segment(chat_id) == "member" else "новый"
+        phone = lookup_phone(u.get("id")) if u.get("id") else ""
+        pline = f"\n<b>Телефон:</b> <code>{phone}</code>" if phone else ""
+        api("sendMessage", chat_id=ORDERS_CHAT, parse_mode="HTML",
+            text=(f"💬 <b>Открыл чат клуба</b> ({seg})\n"
+                  f"<b>{who}</b> · {uname}{pline}\n"
+                  "Переписка — в 1С, вкладка мессенджера."))
+        markup = kb_mixed([[("Открыть чат клуба", "url:" + MANAGER_TG_URL)]])
+        if message_id:
+            return api("editMessageText", chat_id=chat_id, message_id=message_id,
+                       text="Напишите нам в чат клуба — ответим там 🙂",
+                       reply_markup=markup)
+        return api("sendMessage", chat_id=chat_id,
+                   text="Напишите нам в чат клуба — ответим там 🙂",
+                   reply_markup=markup)
+
     with LOCK:
         STATE.setdefault(chat_id, {})["bridge"] = True
     text = "Пишите — передам менеджеру, ответ придёт прямо сюда."
@@ -649,7 +677,7 @@ def on_button(cq):
         return step_member_menu(chat_id, mid)
 
     if data == "bridge":
-        return bridge_on(chat_id, mid)
+        return bridge_on(chat_id, mid, user)
 
     if data == "bridge_off":
         return bridge_off(chat_id, mid)
