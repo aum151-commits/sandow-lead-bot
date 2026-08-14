@@ -356,7 +356,8 @@ def bridge_to_group(chat_id, user, text, message_id=None):
         first = not st.get("bridge_ack")
         st["bridge_ack"] = True
     if first:
-        api("sendMessage", chat_id=chat_id, text="Передал менеджеру. Ответ придёт сюда.")
+        api("sendMessage", chat_id=chat_id, text="Передал менеджеру. Ответ придёт сюда.",
+            reply_markup=kb([[("Завершить разговор", "bridge_off")]]))
     elif message_id:
         api("setMessageReaction", chat_id=chat_id, message_id=message_id,
             reaction=[{"type": "emoji", "emoji": "👌"}])
@@ -378,7 +379,8 @@ def bridge_from_group(msg):
             reply_to_message_id=msg["message_id"],
             text="Могу передать только текст — напишите словами.")
         return True
-    api("sendMessage", chat_id=target, text=f"Менеджер клуба:\n\n{text}")
+    api("sendMessage", chat_id=target, text=f"Менеджер клуба:\n\n{text}",
+        reply_markup=kb([[("Завершить разговор", "bridge_off")]]))
     api("setMessageReaction", chat_id=msg["chat"]["id"],
         message_id=msg["message_id"], reaction=[{"type": "emoji", "emoji": "👌"}])
     return True
