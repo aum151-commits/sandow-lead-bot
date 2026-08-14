@@ -347,18 +347,27 @@ def bridge_on(chat_id, message_id=None, user=None):
         seg = "член клуба" if _segment(chat_id) == "member" else "новый"
         phone = lookup_phone(u.get("id")) if u.get("id") else ""
         pline = f"\n<b>Телефон:</b> <code>{phone}</code>" if phone else ""
+        # Уведомление с подтверждением: пока никто не нажал «Беру» — бот
+        # напоминает через 30 и 60 минут. «Прозевать» становится невозможно.
+        ack_key = f"ack:{chat_id}:{int(time.time())}"
         api("sendMessage", chat_id=ORDERS_CHAT, parse_mode="HTML",
             text=(f"💬 <b>Открыл чат клуба</b> ({seg})\n"
                   f"<b>{who}</b> · {uname}{pline}\n"
-                  "Переписка — в 1С, вкладка мессенджера."))
-        # страховка при дефиците менеджеров: через полчаса — напоминание,
-        # чтобы сообщение во вкладке 1С не провисело незамеченным
-        def _remind(w=who, p=pline):
+                  "Переписка — в 1С, вкладка Телеграм. Кто смотрит — нажмите «Беру»."),
+            reply_markup=kb([[("✅ Беру", ack_key)]]))
+
+        def _remind(round_no, w=who, p=pline, k=ack_key):
+            with LOCK:
+                if STATE.get(k):
+                    return              # уже взяли в работу
+            mark = "⏰" if round_no == 1 else "⚠️ ВТОРОЕ НАПОМИНАНИЕ"
             api("sendMessage", chat_id=ORDERS_CHAT, parse_mode="HTML",
-                text=(f"⏰ <b>Проверьте вкладку Телеграм в 1С</b> — полчаса назад "
-                      f"чат открывал: <b>{w}</b>{p}\n"
-                      "Если уже ответили — просто пропустите."))
-        threading.Timer(1800, _remind).start()
+                text=(f"{mark} <b>Проверьте вкладку Телеграм в 1С</b> — "
+                      f"чат открывал: <b>{w}</b>{p}"),
+                reply_markup=kb([[("✅ Беру", k)]]))
+            if round_no == 1:
+                threading.Timer(1800, _remind, args=(2,)).start()
+        threading.Timer(1800, _remind, args=(1,)).start()
         # если человек не тапнет кнопку, а напишет прямо здесь — мост подхватит:
         # сообщение уйдёт в группу заявок, менеджер ответит реплаем
         with LOCK:
@@ -739,6 +748,15 @@ def on_button(cq):
         with LOCK:
             STATE.setdefault(chat_id, {}).update({"goal": goal, "dir": direction})
         return step_phone(chat_id, mid, goal, direction)
+
+    if data.startswith("ack:"):
+        with LOCK:
+            STATE[data] = True
+        who_took = cq["from"].get("first_name", "менеджер")
+        old = cq["message"].get("text", "")
+        api("editMessageText", chat_id=chat_id, message_id=mid,
+            text=old + f"\n\n✅ Смотрит: {who_took}")
+        return
 
     if data.startswith("take:"):
         who = cq["from"].get("first_name", "менеджер")
