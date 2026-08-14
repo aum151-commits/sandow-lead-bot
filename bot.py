@@ -351,6 +351,14 @@ def bridge_on(chat_id, message_id=None, user=None):
             text=(f"💬 <b>Открыл чат клуба</b> ({seg})\n"
                   f"<b>{who}</b> · {uname}{pline}\n"
                   "Переписка — в 1С, вкладка мессенджера."))
+        # страховка при дефиците менеджеров: через полчаса — напоминание,
+        # чтобы сообщение во вкладке 1С не провисело незамеченным
+        def _remind(w=who, p=pline):
+            api("sendMessage", chat_id=ORDERS_CHAT, parse_mode="HTML",
+                text=(f"⏰ <b>Проверьте вкладку Телеграм в 1С</b> — полчаса назад "
+                      f"чат открывал: <b>{w}</b>{p}\n"
+                      "Если уже ответили — просто пропустите."))
+        threading.Timer(1800, _remind).start()
         markup = kb_mixed([[("✍️ Написать", "url:" + MANAGER_TG_URL)]])
         if message_id:
             return api("editMessageText", chat_id=chat_id, message_id=message_id,
