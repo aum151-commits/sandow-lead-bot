@@ -117,13 +117,34 @@ DIRS = {
 }
 
 
+FALLBACK_CHAT = os.environ.get("FALLBACK_CHAT_ID", "220285486").strip()
+
+
 def api(method, **payload):
     try:
         r = requests.post(f"{API}/{method}", json=payload, timeout=20)
-        return r.json()
+        out = r.json()
+        if not out.get("ok"):
+            print(f"[api] {method} отказ: {out.get('description')}", flush=True)
+        return out
     except Exception as exc:  # сеть моргнула — не роняем обработчик
         print(f"[api] {method}: {exc}", flush=True)
         return {}
+
+
+def send_to_orders(**payload):
+    """Отправка в рабочую группу с запасным выходом.
+
+    14.08 бот оказался удалён из группы заявок, и заявка ушла в никуда —
+    молча. Теперь при недоступной группе сообщение падает в личный чат
+    Ольги с пометкой тревоги: потерять заявку тихо больше нельзя.
+    """
+    r = api("sendMessage", chat_id=ORDERS_CHAT, **payload)
+    if r.get("ok"):
+        return r
+    warn = "⚠️ ГРУППА ЗАЯВОК НЕДОСТУПНА (бот не в группе?) — сообщение ниже не дошло:\n\n"
+    payload["text"] = warn + payload.get("text", "")
+    return api("sendMessage", chat_id=FALLBACK_CHAT, **payload)
 
 
 def kb(rows):
@@ -350,7 +371,7 @@ def bridge_on(chat_id, message_id=None, user=None):
         # Уведомление с подтверждением: пока никто не нажал «Беру» — бот
         # напоминает через 30 и 60 минут. «Прозевать» становится невозможно.
         ack_key = f"ack:{chat_id}:{int(time.time())}"
-        api("sendMessage", chat_id=ORDERS_CHAT, parse_mode="HTML",
+        send_to_orders(parse_mode="HTML",
             text=(f"💬 <b>Открыл чат клуба</b> ({seg})\n"
                   f"<b>{who}</b> · {uname}{pline}\n"
                   "Переписка — в 1С, вкладка Телеграм. Кто смотрит — нажмите «Беру»."),
@@ -361,7 +382,7 @@ def bridge_on(chat_id, message_id=None, user=None):
                 if STATE.get(k):
                     return              # уже взяли в работу
             mark = "⏰" if round_no == 1 else "⚠️ ВТОРОЕ НАПОМИНАНИЕ"
-            api("sendMessage", chat_id=ORDERS_CHAT, parse_mode="HTML",
+            send_to_orders(parse_mode="HTML",
                 text=(f"{mark} <b>Проверьте вкладку Телеграм в 1С</b> — "
                       f"чат открывал: <b>{w}</b>{p}"),
                 reply_markup=kb([[("✅ Беру", k)]]))
@@ -504,7 +525,7 @@ def bridge_to_group(chat_id, user, text, message_id=None):
     phone = lookup_phone(user.get("id"))
     pline = (f"<b>Телефон:</b> <code>{phone}</code> — продолжить диалог из 1С\n"
              if phone else "Телефон не оставлял — отвечайте реплаем здесь\n")
-    api("sendMessage", chat_id=BRIDGE_CHAT, parse_mode="HTML",
+    send_to_orders(parse_mode="HTML",
         text=(f"💬 <b>СООБЩЕНИЕ ИЗ БОТА</b> ({seg})\n\n"
               f"<b>{who}</b> · {uname}\n"
               f"{pline}\n"
@@ -600,8 +621,8 @@ def send_lead(user, phone, goal, direction):
         f"Telegram: {uname} · {now}"
     )
     text += send_to_1c(user, phone, goal, direction)
-    r = api("sendMessage", chat_id=ORDERS_CHAT, text=text, parse_mode="HTML",
-            reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
+    r = send_to_orders(text=text, parse_mode="HTML",
+                        reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
     return (r.get("result") or {}).get("message_id")
 
 
@@ -824,10 +845,9 @@ def on_message(msg):
         save_subscriber(user, call_name=name)
         note = f"✏️ Клиент просит обращаться: <b>{name}</b>"
         if lead_mid:
-            api("sendMessage", chat_id=ORDERS_CHAT, text=note, parse_mode="HTML",
-                reply_to_message_id=lead_mid)
+            send_to_orders(text=note, parse_mode="HTML", reply_to_message_id=lead_mid)
         else:
-            api("sendMessage", chat_id=ORDERS_CHAT, text=note, parse_mode="HTML")
+            send_to_orders(text=note, parse_mode="HTML")
         return api("sendMessage", chat_id=chat_id,
                    text=f"Приятно познакомиться, {name}! 🤝 До встречи в клубе.")
 
