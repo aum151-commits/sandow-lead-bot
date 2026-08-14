@@ -359,6 +359,10 @@ def bridge_on(chat_id, message_id=None, user=None):
                       f"чат открывал: <b>{w}</b>{p}\n"
                       "Если уже ответили — просто пропустите."))
         threading.Timer(1800, _remind).start()
+        # если человек не тапнет кнопку, а напишет прямо здесь — мост подхватит:
+        # сообщение уйдёт в группу заявок, менеджер ответит реплаем
+        with LOCK:
+            STATE.setdefault(chat_id, {})["bridge"] = True
         markup = kb_mixed([[("✍️ Написать", "url:" + MANAGER_TG_URL)]])
         if message_id:
             return api("editMessageText", chat_id=chat_id, message_id=message_id,
