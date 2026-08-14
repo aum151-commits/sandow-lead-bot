@@ -233,9 +233,7 @@ def step_hello(chat_id, message_id=None):
 
 def step_member_menu(chat_id, message_id=None, greet=True):
     """Меню действующего члена клуба. Никаких заявок и продаж — только польза."""
-    text = ("Рад видеть своих! Чем помочь?\n\n"
-            "Если нужен живой человек — жмите «Написать менеджеру», "
-            "переписка пойдёт прямо здесь.") if greet else "Чем ещё помочь?"
+    text = "Рад видеть своих! Чем помочь?" if greet else "Чем ещё помочь?"
     markup = kb_mixed([
         [("📅 Расписание групповых", "url:" + schedule_url())],
         [("❄️ Заморозка абонемента", "url:" + FREEZE_URL)],
@@ -290,9 +288,8 @@ def step_phone(chat_id, message_id, goal, direction):
 def step_done(chat_id, name):
     hi = f"Готово, {name}." if name else "Готово."
     api("sendMessage", chat_id=chat_id, parse_mode="HTML",
-        text=(f"{hi} Ваши <b>72 часа</b> закреплены.\n\n"
-              "Из формальностей — только паспорт: по нему оформят договор на посещение, "
-              "это пять минут. Форма и обувь ваши, остальное наше: полотенца, вода, шкафчик.\n\n"
+        text=(f"{hi} Ваши <b>72 часа</b> закреплены — менеджер свяжется и подберёт дни.\n\n"
+              "С собой паспорт, форма и обувь. Остальное наше: полотенца, вода, шкафчик.\n\n"
               f"{CLUB}\n"
               f"Телефон клуба: {PHONE}"),
         reply_markup={"remove_keyboard": True})
@@ -314,8 +311,7 @@ def step_combat(chat_id, message_id=None):
 def bridge_on(chat_id, message_id=None):
     with LOCK:
         STATE.setdefault(chat_id, {})["bridge"] = True
-    text = ("Пишите — передам менеджеру, ответ придёт прямо сюда.\n"
-            "Когда закончите, нажмите «Завершить разговор».")
+    text = "Пишите — передам менеджеру, ответ придёт прямо сюда."
     markup = kb([[("Завершить разговор", "bridge_off")]])
     if message_id:
         api("editMessageText", chat_id=chat_id, message_id=message_id,
@@ -555,11 +551,11 @@ def on_button(cq):
     if data == "member_phone":
         with LOCK:
             STATE.setdefault(chat_id, {})["member_phone"] = True
-        api("editMessageText", chat_id=chat_id, message_id=mid,
-            text="Нажмите кнопку внизу — я сохраню номер, чтобы находить вас "
-                 "в системе клуба и присылать только то, что касается вас.\n\n"
-                 "Отправляя номер, вы соглашаетесь на обработку персональных данных.")
-        return api("sendMessage", chat_id=chat_id, text="Одним нажатием:",
+        api("deleteMessage", chat_id=chat_id, message_id=mid)
+        return api("sendMessage", chat_id=chat_id,
+                   text="Нажмите кнопку внизу — сохраню номер, чтобы присылать "
+                        "только то, что касается вас.\n\n"
+                        "Отправляя номер, вы соглашаетесь на обработку персональных данных.",
                    reply_markup=ASK_PHONE)
 
     if data == "go":
@@ -647,8 +643,7 @@ def on_message(msg):
             return api("sendMessage", chat_id=chat_id, text=answer,
                        reply_markup=kb([[("💬 Написать менеджеру", "bridge")]]))
         return api("sendMessage", chat_id=chat_id,
-                   text="Передать это менеджеру? Нажмите кнопку — и переписка "
-                        "пойдёт прямо здесь.",
+                   text="Передать это менеджеру?",
                    reply_markup=kb([[("💬 Написать менеджеру", "bridge")],
                                     [("Показать меню", "seg:member")]]))
 
@@ -677,9 +672,9 @@ def finish(chat_id, user, phone):
         member_phone = STATE.get(chat_id, {}).pop("member_phone", False)
     if member_phone or _segment(chat_id) == "member":
         save_subscriber(user, segment="member", phone=phone)
-        return api("sendMessage", chat_id=chat_id,
-                   text="Сохранил. Теперь буду присылать только то, что касается вас.",
-                   reply_markup={"remove_keyboard": True})
+        api("sendMessage", chat_id=chat_id, text="Сохранил 👍",
+            reply_markup={"remove_keyboard": True})
+        return step_member_menu(chat_id, greet=False)
 
     with LOCK:
         st = STATE.get(chat_id, {})
