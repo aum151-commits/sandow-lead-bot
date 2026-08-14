@@ -339,7 +339,66 @@ def bridge_on(chat_id, message_id=None):
         api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
 
 
+def archive_dialog(chat_id):
+    """Завершённый разговор → в 1С (обращение в карточке клиента) и в базу.
+
+    Открытый API 1С не умеет дописывать чат в карточку, поэтому используем
+    лид-приёмник: он привязывает обращение к клиенту по номеру телефона.
+    Без номера в 1С не шлём — некому привязывать; копия в базе остаётся всегда.
+    """
+    with LOCK:
+        st = STATE.get(chat_id, {})
+        dlg = st.pop("dlg", [])
+        seg = st.get("segment", "")
+    if not dlg:
+        return
+    lines = "\n".join(f"— {who}: {txt}" for who, txt in dlg[:60])
+    stamp = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
+
+    def _push():
+        phone = lookup_phone(chat_id)
+        # вечная копия в базе подписчиков
+        try:
+            url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
+            r = requests.get(url, headers=_gh_headers(), timeout=30)
+            if r.status_code == 200:
+                payload = r.json()
+                data = json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
+                rec = data.setdefault(str(chat_id), {})
+                hist = rec.setdefault("dialogs", [])
+                hist.append({"date": stamp, "text": lines})
+                del hist[:-20]          # держим последние 20 разговоров
+                requests.put(url, headers=_gh_headers(), timeout=30, json={
+                    "message": f"tg-бот: переписка {chat_id}",
+                    "content": base64.b64encode(json.dumps(
+                        data, ensure_ascii=False, indent=1).encode()).decode(),
+                    "sha": payload["sha"]})
+        except Exception as exc:
+            print(f"[dlg-base] {exc}", flush=True)
+        # дубль в 1С — только если знаем номер
+        if not (ONEC_WEBHOOK and phone):
+            return
+        try:
+            kind = "член клуба" if seg == "member" else "новый клиент"
+            requests.post(ONEC_WEBHOOK, timeout=25, data={
+                "Name": "Переписка из Telegram-бота",
+                "Phone": re.sub(r"\D", "", phone),
+                "Comment": (f"Переписка из Telegram-бота ({kind}), {stamp}. "
+                            f"НЕ заявка на продажу — журнал диалога:\n{lines}"),
+                "source": ONEC_SOURCE,
+                "formname": "Переписка Telegram-бота",
+                "formid": "sandow_bot_dialog",
+                "tranid": f"tgdlg-{chat_id}-{int(time.time())}",
+            })
+            print(f"[dlg-1c] переписка {chat_id} выгружена", flush=True)
+        except Exception as exc:
+            print(f"[dlg-1c] {exc}", flush=True)
+
+    threading.Thread(target=_push, daemon=True).start()
+
+
 def bridge_off(chat_id, message_id=None):
+    archive_dialog(chat_id)
     with LOCK:
         st = STATE.get(chat_id)
         if st:
@@ -377,6 +436,8 @@ def bridge_to_group(chat_id, user, text, message_id=None):
     who = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
     uname = f"@{user['username']}" if user.get("username") else "без ника"
     seg = "член клуба" if _segment(chat_id) == "member" else "новый"
+    with LOCK:
+        STATE.setdefault(chat_id, {}).setdefault("dlg", []).append(("Клиент", text))
     phone = lookup_phone(user.get("id"))
     pline = (f"<b>Телефон:</b> <code>{phone}</code> — продолжить диалог из 1С\n"
              if phone else "Телефон не оставлял — отвечайте реплаем здесь\n")
@@ -412,6 +473,8 @@ def bridge_from_group(msg):
         return True
     api("sendMessage", chat_id=target, text=f"Менеджер клуба:\n\n{text}",
         reply_markup=kb([[("Завершить разговор", "bridge_off")]]))
+    with LOCK:
+        STATE.setdefault(target, {}).setdefault("dlg", []).append(("Менеджер", text))
     api("setMessageReaction", chat_id=msg["chat"]["id"],
         message_id=msg["message_id"], reaction=[{"type": "emoji", "emoji": "👌"}])
     return True
@@ -658,6 +721,7 @@ def on_message(msg):
         return finish(chat_id, user, phone)
 
     if text.startswith("/start"):
+        archive_dialog(chat_id)
         with LOCK:
             STATE.pop(chat_id, None)
         save_subscriber(user)
