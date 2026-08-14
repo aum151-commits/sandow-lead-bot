@@ -349,16 +349,9 @@ def bridge_to_group(chat_id, user, text, message_id=None):
               f"{text}\n\n"
               f"#id{chat_id}\n"
               "Ответьте реплаем на это сообщение — я передам."))
-    # «Передал» пишем один раз за разговор; на остальные сообщения — тихая
-    # реакция, иначе бот засоряет диалог одинаковыми подтверждениями
-    with LOCK:
-        st = STATE.setdefault(chat_id, {})
-        first = not st.get("bridge_ack")
-        st["bridge_ack"] = True
-    if first:
-        api("sendMessage", chat_id=chat_id, text="Передал менеджеру. Ответ придёт сюда.",
-            reply_markup=kb([[("Завершить разговор", "bridge_off")]]))
-    elif message_id:
+    # Подтверждение не пишем: при входе в режим бот уже сказал «передам,
+    # ответ придёт сюда». Достаточно тихой реакции на сообщении клиента.
+    if message_id:
         api("setMessageReaction", chat_id=chat_id, message_id=message_id,
             reaction=[{"type": "emoji", "emoji": "👌"}])
 
