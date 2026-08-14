@@ -33,6 +33,9 @@ from flask import Flask, request, jsonify
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 ORDERS_CHAT = os.environ.get("ORDERS_CHAT_ID", "").strip()
+# Переписка с клиентами идёт в отдельную группу, чтобы не засорять заявки.
+# Пока переменная не задана — падает туда же, куда заявки (ничего не теряется).
+BRIDGE_CHAT = os.environ.get("BRIDGE_CHAT_ID", "").strip() or ORDERS_CHAT
 HOOK_SECRET = os.environ.get("HOOK_SECRET", "sandow").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
 MSK = timezone(timedelta(hours=3))
@@ -355,7 +358,7 @@ def bridge_to_group(chat_id, user, text, message_id=None):
     who = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
     uname = f"@{user['username']}" if user.get("username") else "без ника"
     seg = "член клуба" if _segment(chat_id) == "member" else "новый"
-    api("sendMessage", chat_id=ORDERS_CHAT, parse_mode="HTML",
+    api("sendMessage", chat_id=BRIDGE_CHAT, parse_mode="HTML",
         text=(f"💬 <b>СООБЩЕНИЕ ИЗ БОТА</b> ({seg})\n\n"
               f"<b>{who}</b> · {uname}\n\n"
               f"{text}\n\n"
@@ -612,6 +615,10 @@ def on_message(msg):
     # В группах бот молчит — с одним исключением: реплай менеджера на
     # сообщение с меткой #id он доставляет клиенту.
     if msg["chat"].get("type") != "private":
+        if (msg.get("text") or "").strip().startswith("/chat_id"):
+            api("sendMessage", chat_id=chat_id, reply_to_message_id=msg["message_id"],
+                text=f"Идентификатор этого чата: {chat_id}")
+            return
         if msg.get("reply_to_message"):
             bridge_from_group(msg)
         return
@@ -619,7 +626,7 @@ def on_message(msg):
     # Ответ менеджера реплаем на карточку с меткой #id. Обычно карточки живут
     # в рабочей группе, но при тестовом режиме ORDERS_CHAT — личный чат, и
     # реплаи должны работать и там.
-    if str(chat_id) == str(ORDERS_CHAT) and msg.get("reply_to_message"):
+    if str(chat_id) in (str(ORDERS_CHAT), str(BRIDGE_CHAT)) and msg.get("reply_to_message"):
         if bridge_from_group(msg):
             return
 
