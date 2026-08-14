@@ -150,7 +150,7 @@ def _gh_headers():
             "User-Agent": "sandow-lead-bot"}
 
 
-def save_subscriber(user, segment=None, phone=None):
+def save_subscriber(user, segment=None, phone=None, call_name=None):
     """Дописывает или обновляет запись о человеке в базе подписчиков.
 
     Работает в отдельном потоке: GitHub отвечает не мгновенно, а Telegram
@@ -158,11 +158,11 @@ def save_subscriber(user, segment=None, phone=None):
     """
     if not GH_TOKEN:
         return
-    threading.Thread(target=_save_subscriber, args=(dict(user), segment, phone),
+    threading.Thread(target=_save_subscriber, args=(dict(user), segment, phone, call_name),
                      daemon=True).start()
 
 
-def _save_subscriber(user, segment, phone):
+def _save_subscriber(user, segment, phone, call_name=None):
     try:
         url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
         r = requests.get(url, headers=_gh_headers(), timeout=30)
@@ -185,6 +185,8 @@ def _save_subscriber(user, segment, phone):
             rec["segment"] = segment
         if phone:
             rec["phone"] = phone
+        if call_name:
+            rec["call_name"] = call_name
         data[key] = rec
 
         body = {"message": f"tg-бот: подписчик {key} ({rec.get('segment', '?')})",
@@ -300,7 +302,8 @@ def step_done(chat_id, name):
         text=(f"{hi} Ваши <b>72 часа</b> закреплены — менеджер свяжется и подберёт дни.\n\n"
               "С собой паспорт, форма и обувь. Остальное наше: полотенца, вода, шкафчик.\n\n"
               f"{CLUB}\n"
-              f"Телефон клуба: {PHONE}"),
+              f"Телефон клуба: {PHONE}\n\n"
+              "Кстати, как к вам обращаться? Можно не отвечать — всё уже записано."),
         reply_markup={"remove_keyboard": True})
 
 
@@ -441,8 +444,9 @@ def send_lead(user, phone, goal, direction):
         f"Telegram: {uname} · {now}"
     )
     text += send_to_1c(user, phone, goal, direction)
-    api("sendMessage", chat_id=ORDERS_CHAT, text=text, parse_mode="HTML",
-        reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
+    r = api("sendMessage", chat_id=ORDERS_CHAT, text=text, parse_mode="HTML",
+            reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
+    return (r.get("result") or {}).get("message_id")
 
 
 # Частые вопросы: с сайта заходят с ними чаще, чем с готовностью оставить номер.
@@ -636,6 +640,27 @@ def on_message(msg):
     if in_bridge and text:
         return bridge_to_group(chat_id, user, text, msg.get("message_id"))
 
+    # после заявки спросили, как обращаться — ловим ответ. Необязательный шаг:
+    # что бы человек ни написал дальше, заявка уже ушла и ничего не теряется.
+    with LOCK:
+        st = STATE.get(chat_id, {})
+        awaiting = st.get("await_name")
+        lead_mid = st.get("lead_mid")
+    if awaiting and text and not text.startswith("/") \
+            and len(text) <= 40 and len(re.sub(r"\D", "", text)) < 6:
+        name = re.sub(r"^(меня зовут|я|это)\s+", "", text, flags=re.I).strip(" .,!")
+        with LOCK:
+            STATE.get(chat_id, {}).pop("await_name", None)
+        save_subscriber(user, call_name=name)
+        note = f"✏️ Клиент просит обращаться: <b>{name}</b>"
+        if lead_mid:
+            api("sendMessage", chat_id=ORDERS_CHAT, text=note, parse_mode="HTML",
+                reply_to_message_id=lead_mid)
+        else:
+            api("sendMessage", chat_id=ORDERS_CHAT, text=note, parse_mode="HTML")
+        return api("sendMessage", chat_id=chat_id,
+                   text=f"Приятно познакомиться, {name}! Передал менеджеру 👍")
+
     # человек прислал номер текстом
     if PHONE_RE.fullmatch(text or "") or len(re.sub(r"\D", "", text or "")) >= 10:
         phone = clean_phone(text)
@@ -694,12 +719,12 @@ def finish(chat_id, user, phone):
                         f"Если срочно, наберите нас: {PHONE}",
                    reply_markup={"remove_keyboard": True})
     save_subscriber(user, segment="new", phone=phone)
-    send_lead(user, phone, goal, direction)
+    lead_mid = send_lead(user, phone, goal, direction)
     step_done(chat_id, user.get("first_name"))
     with LOCK:
         st = STATE.get(chat_id, {})
         seg = st.get("segment")
-        STATE[chat_id] = {"segment": seg} if seg else {}
+        STATE[chat_id] = {"segment": seg, "await_name": True, "lead_mid": lead_mid}
 
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
