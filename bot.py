@@ -329,6 +329,7 @@ def bridge_off(chat_id, message_id=None):
         st = STATE.get(chat_id)
         if st:
             st.pop("bridge", None)
+            st.pop("bridge_ack", None)
     seg = _segment(chat_id)
     if message_id:
         api("editMessageText", chat_id=chat_id, message_id=message_id,
@@ -337,7 +338,7 @@ def bridge_off(chat_id, message_id=None):
         step_member_menu(chat_id, greet=False)
 
 
-def bridge_to_group(chat_id, user, text):
+def bridge_to_group(chat_id, user, text, message_id=None):
     """Сообщение клиента → рабочая группа. Метка #id — по ней вернётся ответ."""
     who = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
     uname = f"@{user['username']}" if user.get("username") else "без ника"
@@ -348,7 +349,17 @@ def bridge_to_group(chat_id, user, text):
               f"{text}\n\n"
               f"#id{chat_id}\n"
               "Ответьте реплаем на это сообщение — я передам."))
-    api("sendMessage", chat_id=chat_id, text="Передал менеджеру. Ответ придёт сюда.")
+    # «Передал» пишем один раз за разговор; на остальные сообщения — тихая
+    # реакция, иначе бот засоряет диалог одинаковыми подтверждениями
+    with LOCK:
+        st = STATE.setdefault(chat_id, {})
+        first = not st.get("bridge_ack")
+        st["bridge_ack"] = True
+    if first:
+        api("sendMessage", chat_id=chat_id, text="Передал менеджеру. Ответ придёт сюда.")
+    elif message_id:
+        api("setMessageReaction", chat_id=chat_id, message_id=message_id,
+            reaction=[{"type": "emoji", "emoji": "👌"}])
 
 
 BRIDGE_TAG = re.compile(r"#id(-?\d+)")
@@ -623,7 +634,7 @@ def on_message(msg):
     with LOCK:
         in_bridge = STATE.get(chat_id, {}).get("bridge")
     if in_bridge and text:
-        return bridge_to_group(chat_id, user, text)
+        return bridge_to_group(chat_id, user, text, msg.get("message_id"))
 
     # человек прислал номер текстом
     if PHONE_RE.fullmatch(text or "") or len(re.sub(r"\D", "", text or "")) >= 10:
