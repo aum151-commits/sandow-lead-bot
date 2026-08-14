@@ -351,13 +351,13 @@ def bridge_on(chat_id, message_id=None, user=None):
             text=(f"💬 <b>Открыл чат клуба</b> ({seg})\n"
                   f"<b>{who}</b> · {uname}{pline}\n"
                   "Переписка — в 1С, вкладка мессенджера."))
-        markup = kb_mixed([[("Открыть чат клуба", "url:" + MANAGER_TG_URL)]])
+        markup = kb_mixed([[("✍️ Написать", "url:" + MANAGER_TG_URL)]])
         if message_id:
             return api("editMessageText", chat_id=chat_id, message_id=message_id,
-                       text="Ждём ваше сообщение 👇",
+                       text="Мы на связи — пишите 🙂",
                        reply_markup=markup)
         return api("sendMessage", chat_id=chat_id,
-                   text="Ждём ваше сообщение 👇",
+                   text="Мы на связи — пишите 🙂",
                    reply_markup=markup)
 
     with LOCK:
