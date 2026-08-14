@@ -281,9 +281,12 @@ def step_phone(chat_id, message_id, goal, direction):
         "fight": "Уважаем — бокс закаляет 🥊",
         "any": "И правильно, что не решили заранее — попробуете всё и поймёте, что ваше 👍",
     }.get(direction, "Отличный план 👍")
+    gname = GOALS.get(goal, "").lower()
+    dname = DIRS.get(direction, DIRS["any"])[0].lower()
     api("deleteMessage", chat_id=chat_id, message_id=message_id)
     api("sendMessage", chat_id=chat_id, parse_mode="HTML",
-        text=(f"{warm}\n\n"
+        text=(f"{warm}\n"
+              f"Записал: <b>{gname}</b>, начнёте с направления «{dname}».\n\n"
               "🎁 <b>Дарим вам 72 часа в клубе</b> — три дня подряд, "
               "всё включено: зал 1100 м², групповые, сауна.\n\n"
               "Нажмите кнопку внизу или напишите номер.\n\n"
