@@ -285,10 +285,14 @@ def step_phone(chat_id, message_id, goal, direction):
     }.get(direction, "Отличный план 👍")
     gname = GOALS.get(goal, "").lower()
     dname = DIRS.get(direction, DIRS["any"])[0].lower()
+    # «начнёте с направления „ещё не решил“» звучит нелепо — для этого
+    # варианта направление не называем, тёплая строка уже всё сказала
+    fixed = (f"Записал: <b>{gname}</b>." if direction == "any"
+             else f"Записал: <b>{gname}</b>, начнёте с направления «{dname}».")
     api("deleteMessage", chat_id=chat_id, message_id=message_id)
     api("sendMessage", chat_id=chat_id, parse_mode="HTML",
         text=(f"{warm}\n"
-              f"Записал: <b>{gname}</b>, начнёте с направления «{dname}».\n\n"
+              f"{fixed}\n\n"
               "🎁 <b>Дарим вам 72 часа в клубе</b> — три дня подряд, "
               "всё включено: зал 1100 м², групповые программы, сауна.\n\n"
               "Нажмите кнопку внизу или напишите номер.\n\n"
