@@ -848,6 +848,17 @@ def on_message(msg):
             send_to_orders(text=note, parse_mode="HTML", reply_to_message_id=lead_mid)
         else:
             send_to_orders(text=note, parse_mode="HTML")
+        # сразу открываем дорогу в клубный Телеграм: пока клиент сам не написал
+        # первым, номерной аккаунт 1С не может отправить ему ни слова
+        # (приватность Телеграма) — 15.08 заявка Татьяны осталась без связи
+        if MANAGER_TG_URL:
+            return api("sendMessage", chat_id=chat_id,
+                       text=(f"Приятно познакомиться, {name}! 🤝\n\n"
+                             "Чтобы мы могли писать вам здесь, в Телеграме, — "
+                             "нажмите кнопку и отправьте нам любое сообщение, "
+                             "хоть «привет» 🙂"),
+                       reply_markup=kb_mixed([[("✍️ Открыть чат клуба",
+                                                "url:" + MANAGER_TG_URL)]]))
         return api("sendMessage", chat_id=chat_id,
                    text=f"Приятно познакомиться, {name}! 🤝 До встречи в клубе.")
 
@@ -919,7 +930,7 @@ def finish(chat_id, user, phone):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-08-13-v2-members-bridge"
+VERSION = "2026-08-15-v3-bridge-after-name"
 
 
 @app.route("/health")
