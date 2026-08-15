@@ -297,9 +297,13 @@ def step_goal(chat_id, message_id, intro=False):
         ]))
 
 
-def step_dir(chat_id, message_id, goal):
+def step_dir(chat_id, message_id, goal, intro=False):
+    # Сокращение 15.08 по тесту Ольги: путь был в 5 шагов, клиент не доходил.
+    # Вопрос о цели убран (её выясняет менеджер в звонке) — остался один вопрос.
+    text = ("Подберу вам первые визиты — один вопрос.\n\nС чего начнёте?"
+            if intro else "С чего начнёте?")
     api("editMessageText", chat_id=chat_id, message_id=message_id,
-        text="С чего начнёте?", reply_markup=kb([
+        text=text, reply_markup=kb([
             [("Тренажёрный зал", f"d:gym:{goal}")],
             [("Групповые программы", f"d:group:{goal}")],
             [("Бокс и кикбоксинг", f"d:fight:{goal}")],
@@ -316,16 +320,16 @@ def step_phone(chat_id, message_id, goal, direction):
         "fight": "Уважаем — бокс закаляет 🥊",
         "any": "И правильно — попробуете всё и поймёте, что ваше 👍",
     }.get(direction, "Отличный план 👍")
-    gname = GOALS.get(goal, "").lower()
     dname = DIRS.get(direction, DIRS["any"])[0].lower()
     # «начнёте с направления „ещё не решил“» звучит нелепо — для этого
-    # варианта направление не называем, тёплая строка уже всё сказала
-    fixed = (f"Записал: <b>{gname}</b>." if direction == "any"
-             else f"Записал: <b>{gname}</b>, начнёте с направления «{dname}».")
+    # варианта направление не называем, тёплая строка уже всё сказала.
+    # Вопроса о цели больше нет — упоминаем только направление.
+    fixed = ("" if direction == "any"
+             else f"Записал: начнёте с направления «{dname}».")
     api("deleteMessage", chat_id=chat_id, message_id=message_id)
+    body = f"{warm}\n{fixed}\n\n" if fixed else f"{warm}\n\n"
     api("sendMessage", chat_id=chat_id, parse_mode="HTML",
-        text=(f"{warm}\n"
-              f"{fixed}\n\n"
+        text=(body +
               "🎁 <b>Дарим вам 72 часа в клубе</b> — три дня подряд, "
               "всё включено: зал 1100 м², групповые программы, сауна.\n\n"
               "Чтобы закрепить подарок за вами — нажмите кнопку внизу или напишите номер.\n\n"
@@ -334,13 +338,24 @@ def step_phone(chat_id, message_id, goal, direction):
 
 
 def step_done(chat_id, name):
-    hi = f"Готово, {name}." if name else "Готово."
+    # Сокращение 15.08: вопрос «как обращаться?» убран (имя берём из Телеграма,
+    # остальное менеджер уточнит в звонке) — сразу мост в клубный Телеграм.
+    # Тексты моста согласованы Ольгой: коротко, кнопка сама говорит, что делать.
+    hi = f"Готово, {name}!" if name else "Готово!"
+    if MANAGER_TG_URL:
+        btn = kb_mixed([[("Написать нам «Подарок»", "url:" + MANAGER_TG_URL)]])
+        api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"{hi} Подарок закреплён 🎁 До него один шаг:",
+            reply_markup=btn)
+
+        def _nudge(cid=chat_id, b=btn):
+            api("sendMessage", chat_id=cid, text="Подарок ждёт 🎁", reply_markup=b)
+        threading.Timer(2700, _nudge).start()
+        return
     api("sendMessage", chat_id=chat_id, parse_mode="HTML",
         text=(f"{hi} Ваши <b>72 часа</b> закреплены — мы с вами свяжемся и подберём дни.\n\n"
-              "Возьмите, пожалуйста, с собой паспорт, форму и обувь. Остальное наше: полотенца, вода, шкафчик.\n\n"
               f"{CLUB}\n"
-              f"Телефон клуба: {PHONE}\n\n"
-              "Кстати, как к вам обращаться? 🙂"),
+              f"Телефон клуба: {PHONE}"),
         reply_markup={"remove_keyboard": True})
 
 
@@ -724,7 +739,7 @@ def on_button(cq):
         with LOCK:
             STATE.setdefault(chat_id, {})["segment"] = "new"
         save_subscriber(user, segment="new")
-        return step_goal(chat_id, mid, intro=True)
+        return step_dir(chat_id, mid, "", intro=True)
 
     if data == "seg:member":
         with LOCK:
@@ -749,7 +764,7 @@ def on_button(cq):
                    reply_markup=ASK_PHONE)
 
     if data == "go":
-        return step_goal(chat_id, mid)
+        return step_dir(chat_id, mid, "")
 
     if data == "combat":
         return step_combat(chat_id, mid)
@@ -894,7 +909,7 @@ def on_message(msg):
                                     [("💬 Написать менеджеру", "bridge")]]))
 
     api("sendMessage", chat_id=chat_id,
-        text="Подберу вам первые визиты — всего два вопроса. "
+        text="Подберу вам первые визиты — один вопрос. "
              "Или спросите словами, отвечу.",
         reply_markup=kb_mixed([[("Подобрать первые визиты", "go")],
                          [("💬 Написать менеджеру", "bridge")],
@@ -930,12 +945,12 @@ def finish(chat_id, user, phone):
     with LOCK:
         st = STATE.get(chat_id, {})
         seg = st.get("segment")
-        STATE[chat_id] = {"segment": seg, "await_name": True, "lead_mid": lead_mid}
+        STATE[chat_id] = {"segment": seg, "lead_mid": lead_mid}
 
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-08-15-v5-gift-short"
+VERSION = "2026-08-15-v6-three-steps"
 
 
 @app.route("/health")
