@@ -376,12 +376,33 @@ def bridge_on(chat_id, message_id=None, user=None):
     # Подключён Telegram клуба (интеграция с 1С): клиента отправляем туда —
     # переписка рождается во вкладке мессенджера 1С и в карточке клиента.
     # Здесь остаётся только отметка в группу заявок для контроля.
+    u = user or {}
+    phone = lookup_phone(u.get("id")) if u.get("id") else ""
+
+    # Без номера переписку не открываем: ник без номера — отдельная,
+    # не связанная с 1С карточка (инцидент с Лерой 16.08.2026, у клиента
+    # завелись две несвязанные карточки — ПЧК и ЧК). Сначала номер,
+    # потом мост. Поправка Ольги 16.08.2026.
+    if not phone:
+        with LOCK:
+            st = STATE.setdefault(chat_id, {})
+            st["member_phone"] = True
+            st["want_bridge_after_phone"] = True
+        # ASK_PHONE — обычная (не инлайн) клавиатура, editMessageText с ней
+        # не работает (Telegram ждёт инлайн-разметку) — поэтому удаляем
+        # старое сообщение с кнопкой и шлём новое, как в "member_phone".
+        if message_id:
+            api("deleteMessage", chat_id=chat_id, message_id=message_id)
+        api("sendMessage", chat_id=chat_id,
+            text=("Чтобы связать переписку с вашей карточкой в 1С, сначала оставьте "
+                  "номер — один раз, дальше не будем спрашивать."),
+            reply_markup=ASK_PHONE)
+        return
+
     if MANAGER_TG_URL:
-        u = user or {}
         who = " ".join(x for x in [u.get("first_name"), u.get("last_name")] if x) or "без имени"
         uname = f"@{u['username']}" if u.get("username") else "без ника"
         seg = "член клуба" if _segment(chat_id) == "member" else "новый"
-        phone = lookup_phone(u.get("id")) if u.get("id") else ""
         pline = f"\n<b>Телефон:</b> <code>{phone}</code>" if phone else ""
         # Уведомление с подтверждением: пока никто не нажал «Беру» — бот
         # напоминает через 30 и 60 минут. «Прозевать» становится невозможно.
@@ -942,11 +963,15 @@ def finish(chat_id, user, phone):
     # член клуба делится номером для связи — это не заявка: в 1С не шлём,
     # менеджеров не дёргаем, просто запоминаем в базе
     with LOCK:
-        member_phone = STATE.get(chat_id, {}).pop("member_phone", False)
+        st = STATE.setdefault(chat_id, {})
+        member_phone = st.pop("member_phone", False)
+        want_bridge = st.pop("want_bridge_after_phone", False)
     if member_phone or _segment(chat_id) == "member":
         save_subscriber(user, segment="member", phone=phone)
         api("sendMessage", chat_id=chat_id, text="Сохранил 👍",
             reply_markup={"remove_keyboard": True})
+        if want_bridge:
+            return bridge_on(chat_id, user=user)
         return step_member_menu(chat_id, greet=False)
 
     with LOCK:
