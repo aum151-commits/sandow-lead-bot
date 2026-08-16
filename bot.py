@@ -493,6 +493,7 @@ def bridge_off(chat_id, message_id=None):
         if st:
             st.pop("bridge", None)
             st.pop("bridge_ack", None)
+            st.pop("bridge_fallback_notified", None)
     seg = _segment(chat_id)
     if message_id:
         api("editMessageText", chat_id=chat_id, message_id=message_id,
@@ -840,11 +841,28 @@ def on_message(msg):
                    text=f"Клуб «Сандов Фитнес», {CLUB}. Телефон {PHONE}.\n"
                         "Наберите /start — помогу и с первым визитом, и по клубу.")
 
-    # мост открыт — любые слова уходят менеджеру
+    # мост открыт: если клиент не тапнул кнопку «Написать», а пишет прямо
+    # здесь — в группу уходит только первое такое сообщение (для контроля).
+    # Дальше не спамим группу репостами: переписка должна идти в клубный
+    # Телеграм (1С, вкладка Мессенджер), туда и подталкиваем каждый раз.
+    # Поправка Ольги 16.08.2026.
     with LOCK:
-        in_bridge = STATE.get(chat_id, {}).get("bridge")
+        st = STATE.setdefault(chat_id, {})
+        in_bridge = st.get("bridge")
+        already_nudged = st.get("bridge_fallback_notified")
     if in_bridge and text:
-        return bridge_to_group(chat_id, user, text, msg.get("message_id"))
+        if not already_nudged or not MANAGER_TG_URL:
+            with LOCK:
+                STATE.setdefault(chat_id, {})["bridge_fallback_notified"] = True
+            return bridge_to_group(chat_id, user, text, msg.get("message_id"))
+        with LOCK:
+            st2 = STATE.setdefault(chat_id, {})
+            st2.setdefault("dlg", []).append(("Клиент", text))
+            st2["dlg_ts"] = time.time()
+        markup = kb_mixed([[("✍️ Написать", "url:" + MANAGER_TG_URL)]])
+        return api("sendMessage", chat_id=chat_id,
+                   text="Мы уже на связи в клубном чате — продолжим там 🙂",
+                   reply_markup=markup)
 
     # после заявки спросили, как обращаться — ловим ответ. Необязательный шаг:
     # что бы человек ни написал дальше, заявка уже ушла и ничего не теряется.
