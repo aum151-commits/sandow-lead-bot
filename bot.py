@@ -179,6 +179,57 @@ def _gh_headers():
             "User-Agent": "sandow-lead-bot"}
 
 
+LEADS_GH_PATH = "data/lead_response_log.json"
+
+
+def log_lead_event(user_id, event, who=None):
+    """Пишет момент создания заявки и момент «Беру в работу» — источник для
+    метрики SLA (норматив 3 минуты, по разбору с коучем 18.08.2026). Раньше
+    такого лога не было нигде: ни у Тильды, ни у бота, поэтому текущее время
+    ответа не с чем было сверить."""
+    if not GH_TOKEN:
+        return
+    threading.Thread(target=_log_lead_event, args=(str(user_id), event, who), daemon=True).start()
+
+
+def _log_lead_event(user_id, event, who):
+    try:
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/{LEADS_GH_PATH}"
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
+        if r.status_code == 200:
+            payload = r.json()
+            data = json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
+            sha = payload["sha"]
+        else:
+            data, sha = {}, None
+
+        rec = data.get(user_id, {})
+        now = datetime.now(MSK)
+        if event == "lead_created":
+            rec["lead_created_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        elif event == "taken" and not rec.get("taken_at"):
+            rec["taken_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            rec["taken_by"] = who or ""
+            if rec.get("lead_created_at"):
+                try:
+                    created = datetime.strptime(rec["lead_created_at"], "%Y-%m-%d %H:%M:%S")
+                    rec["response_seconds"] = int((now.replace(tzinfo=None) - created).total_seconds())
+                except Exception:
+                    pass
+        data[user_id] = rec
+
+        body = {"message": f"lead-log: {event} {user_id}",
+                "content": base64.b64encode(
+                    json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
+        if sha:
+            body["sha"] = sha
+        w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
+        if w.status_code not in (200, 201):
+            print(f"[lead-log] запись не прошла: {w.status_code} {w.text[:120]}", flush=True)
+    except Exception as exc:
+        print(f"[lead-log] {exc}", flush=True)
+
+
 def save_subscriber(user, segment=None, phone=None, call_name=None):
     """Дописывает или обновляет запись о человеке в базе подписчиков.
 
@@ -660,6 +711,7 @@ def send_lead(user, phone, goal, direction):
     text += send_to_1c(user, phone, goal, direction)
     r = send_to_orders(text=text, parse_mode="HTML",
                         reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
+    log_lead_event(user.get("id"), "lead_created")
     return (r.get("result") or {}).get("message_id")
 
 
@@ -821,6 +873,7 @@ def on_button(cq):
         old = cq["message"].get("text", "")
         api("editMessageText", chat_id=chat_id, message_id=mid,
             text=old + f"\n\n✅ В работе: {who}")
+        log_lead_event(data.split(":", 1)[1], "taken", who)
 
 
 def on_message(msg):
