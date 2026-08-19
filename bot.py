@@ -117,6 +117,37 @@ DIRS = {
 }
 
 
+# Тематические входы с лендингов: t.me/sandowclub_bot?start=<код>.
+# Человек пришёл со страницы про конкретное направление — первое сообщение
+# продолжает тему, а не начинает с нуля (раньше был шов: лендинг про бокс,
+# а бот сразу про 72 часа). Дальше сценарий обычный, без изменений.
+# Код темы уходит менеджеру строкой «Источник» в заявке.
+# ММА в текстах нет намеренно: в клубе только бокс и кикбоксинг.
+LANDINGS = {
+    "boks": ("лендинг Бокс",
+             "Интересует бокс? Отличный выбор — в «Сандов Фитнес» первое занятие "
+             "боксом бесплатное. И сверх этого дарим 72 часа в клубе: тренажёрный "
+             "зал 1100 м², групповые программы и финская сауна — три дня полного доступа."),
+    "kik": ("лендинг Кикбоксинг",
+            "Интересует кикбоксинг? В «Сандов Фитнес» он есть и в группах по "
+            "расписанию, и персонально с тренером. А ещё дарим 72 часа в клубе — "
+            "три дня полного доступа: зал 1100 м², групповые программы, сауна."),
+    "zal": ("лендинг Тренажёрный зал",
+            "Ищете тренажёрный зал? В «Сандов Фитнес» он занимает 1100 м²: свободные "
+            "веса, тренажёры по группам мышц, помост для становой и приседа. "
+            "И дарим 72 часа в клубе — три дня подряд, чтобы всё попробовать."),
+    "noch": ("лендинг Круглосуточный фитнес",
+             "Удобнее тренироваться поздно вечером или рано утром? «Сандов Фитнес» "
+             "открыт для членов клуба круглосуточно, без выходных. А знакомство "
+             "начните с подарка — дарим 72 часа в клубе: зал 1100 м², "
+             "групповые программы, сауна."),
+    "boec": ("лендинг Бойцовский клуб",
+             "Интересуют единоборства? Бойцовский клуб «Сандов Фитнес» — 500 м²: "
+             "бокс и кикбоксинг, ринг и мешки, персональные тренировки. Первое "
+             "занятие боксом бесплатное, и сверх этого дарим 72 часа в клубе."),
+}
+
+
 FALLBACK_CHAT = os.environ.get("FALLBACK_CHAT_ID", "220285486").strip()
 
 
@@ -283,10 +314,19 @@ def _save_subscriber(user, segment, phone, call_name=None):
 
 # ---------------------------------------------------------------- шаги диалога
 
-def step_gate(chat_id, name):
-    """Развилка: бот обслуживает и новых людей, и действующих членов клуба."""
+def step_gate(chat_id, name, theme=None):
+    """Развилка: бот обслуживает и новых людей, и действующих членов клуба.
+
+    theme — код лендинга из deep-link (/start boks): первое сообщение
+    начинается с темы страницы, дальше сценарий прежний. Без темы —
+    текст прежний, слово в слово.
+    """
+    if theme in LANDINGS:
+        text = LANDINGS[theme][1]
+    else:
+        text = "Здравствуйте, это Сандов Фитнес на Нижегородской 🏆"
     api("sendMessage", chat_id=chat_id, parse_mode="HTML",
-        text="Здравствуйте, это Сандов Фитнес на Нижегородской 🏆",
+        text=text,
         reply_markup=kb([
             [("Хочу в клуб", "seg:new")],
             [("Уже занимаюсь", "seg:member")],
@@ -659,7 +699,7 @@ def _segment(chat_id):
 
 # ------------------------------------------------------------------- заявка
 
-def send_to_1c(user, phone, goal, direction):
+def send_to_1c(user, phone, goal, direction, source=""):
     """Заводит заявку в 1С:Фитнес клуб. Возвращает приписку к сообщению в группе.
 
     Данные уходят формой — тем же способом, каким шлёт Тильда. JSON приёмник
@@ -674,7 +714,8 @@ def send_to_1c(user, phone, goal, direction):
         "Phone": re.sub(r"\D", "", phone or ""),
         "Comment": (f"Заявка из Telegram-бота. Подарок: {GIFT}. "
                     f"Задача: {GOALS.get(goal, 'не указана')}. "
-                    f"Начнёт с: {DIRS.get(direction, DIRS['any'])[0]}."),
+                    f"Начнёт с: {DIRS.get(direction, DIRS['any'])[0]}."
+                    + (f" Источник: {source}." if source else "")),
         "source": ONEC_SOURCE,
         "utm_source": "telegram",
         "utm_medium": "bot",
@@ -695,20 +736,22 @@ def send_to_1c(user, phone, goal, direction):
         return "\n\n⚠️ В 1С не попало (нет связи) — занесите вручную"
 
 
-def send_lead(user, phone, goal, direction):
+def send_lead(user, phone, goal, direction, source=""):
     who = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
     uname = f"@{user['username']}" if user.get("username") else "без ника"
     now = datetime.now(MSK).strftime("%d.%m в %H:%M")
+    src_line = f"<b>Источник:</b> {source}\n" if source else ""
     text = (
         "🎁 <b>ЗАЯВКА ИЗ TELEGRAM-БОТА</b>\n\n"
         f"<b>Имя:</b> {who}\n"
         f"<b>Телефон:</b> <code>{phone}</code>\n\n"
         f"<b>Подарок:</b> {GIFT}\n"
         f"<b>Задача:</b> {GOALS.get(goal, 'не указана')}\n"
-        f"<b>Начнёт с:</b> {DIRS.get(direction, DIRS['any'])[0]}\n\n"
+        f"<b>Начнёт с:</b> {DIRS.get(direction, DIRS['any'])[0]}\n"
+        f"{src_line}\n"
         f"Telegram: {uname} · {now}"
     )
-    text += send_to_1c(user, phone, goal, direction)
+    text += send_to_1c(user, phone, goal, direction, source)
     r = send_to_orders(text=text, parse_mode="HTML",
                         reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
     log_lead_event(user.get("id"), "lead_created")
@@ -905,10 +948,17 @@ def on_message(msg):
 
     if text.startswith("/start"):
         archive_dialog(chat_id)
+        # deep-link с лендинга: «/start boks» → тема разговора с первого слова
+        parts = text.split(maxsplit=1)
+        theme = parts[1].strip().lower() if len(parts) > 1 else ""
+        if theme not in LANDINGS:
+            theme = None
         with LOCK:
             STATE.pop(chat_id, None)
+            if theme:
+                STATE[chat_id] = {"src": theme}
         save_subscriber(user)
-        return step_gate(chat_id, user.get("first_name"))
+        return step_gate(chat_id, user.get("first_name"), theme=theme)
 
     if text.startswith("/help"):
         return api("sendMessage", chat_id=chat_id,
@@ -1030,13 +1080,14 @@ def finish(chat_id, user, phone):
     with LOCK:
         st = STATE.get(chat_id, {})
     goal, direction = st.get("goal", "keep"), st.get("dir", "any")
+    source = LANDINGS.get(st.get("src"), ("",))[0]
     if too_soon(user.get("id")):
         return api("sendMessage", chat_id=chat_id,
                    text="Ваш номер уже у нас — позвоним. "
                         f"Если срочно, наберите нас: {PHONE}",
                    reply_markup={"remove_keyboard": True})
     save_subscriber(user, segment="new", phone=phone)
-    lead_mid = send_lead(user, phone, goal, direction)
+    lead_mid = send_lead(user, phone, goal, direction, source)
     step_done(chat_id, user.get("first_name"))
     with LOCK:
         st = STATE.get(chat_id, {})
@@ -1046,7 +1097,7 @@ def finish(chat_id, user, phone):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-08-15-v6-three-steps"
+VERSION = "2026-08-19-v7-landing-deeplinks"
 
 
 @app.route("/health")
