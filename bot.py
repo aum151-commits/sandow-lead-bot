@@ -1095,9 +1095,71 @@ def finish(chat_id, user, phone):
         STATE[chat_id] = {"segment": seg, "lead_mid": lead_mid}
 
 
+# ── Заявка с сайта ──────────────────────────────────────────────────────────
+# Кнопка в Телеграм у части людей просто не открывается: без ВПН страница
+# бота не грузится (проверено 26.08). Для них — короткая форма прямо на
+# странице: одно поле и кнопка. Заявка уходит туда же, куда заявки бота:
+# в группу менеджеров и в 1С, тем же send_to_1c.
+
+SITE_ORIGINS = ("https://lp.sandowfitness.ru", "https://sandowfitness.ru")
+_SITE_LEADS = {}          # телефон -> время последней заявки, от дублей
+_SITE_LOCK = threading.Lock()
+
+
+def _cors(resp, origin):
+    if origin in SITE_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
+@app.route("/site-lead", methods=["POST", "OPTIONS"])
+def site_lead():
+    origin = request.headers.get("Origin", "")
+    if request.method == "OPTIONS":
+        return _cors(app.make_response(("", 204)), origin)
+
+    data = request.get_json(silent=True) or request.form or {}
+    # ловушка для роботов: поле спрятано от людей, заполняется только ботами
+    if (data.get("company") or "").strip():
+        return _cors(jsonify(ok=True), origin)
+
+    raw_phone = (data.get("phone") or "").strip()
+    digits = re.sub(r"\D", "", raw_phone)
+    if len(digits) < 10:
+        return _cors(jsonify(ok=False, error="phone"), origin), 400
+    phone = "+7" + digits[-10:]
+
+    # один и тот же номер дважды за десять минут — не тревожим менеджеров
+    now = time.time()
+    with _SITE_LOCK:
+        last = _SITE_LEADS.get(phone, 0)
+        _SITE_LEADS[phone] = now
+    if now - last < 600:
+        return _cors(jsonify(ok=True, repeat=True), origin)
+
+    page = (data.get("page") or "").strip()[:120]
+    name = (data.get("name") or "").strip()[:60]
+    when = datetime.now(MSK).strftime("%d.%m в %H:%M")
+
+    text = (
+        "🌐 <b>ЗАЯВКА С САЙТА</b>\n\n"
+        f"<b>Имя:</b> {name or 'не указано'}\n"
+        f"<b>Телефон:</b> <code>{phone}</code>\n\n"
+        f"<b>Подарок:</b> {GIFT}\n"
+        f"<b>Страница:</b> {page or 'не указана'}\n\n"
+        f"Форма на статье · {when}"
+    )
+    user = {"id": f"site-{digits[-10:]}", "first_name": name or "Гость с сайта"}
+    text += send_to_1c(user, phone, "keep", "any", f"статья: {page}")
+    send_to_orders(text=text, parse_mode="HTML")
+    return _cors(jsonify(ok=True), origin)
+
+
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-08-19-v7-landing-deeplinks"
+VERSION = "2026-08-26-v8-site-lead-form"
 
 
 @app.route("/health")
