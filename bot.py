@@ -1143,6 +1143,15 @@ def site_lead():
     name = (data.get("name") or "").strip()[:60]
     when = datetime.now(MSK).strftime("%d.%m в %H:%M")
 
+    # Проверочные номера (+7 000 ...) в рабочую группу не идут: она для
+    # живых заявок, а не для наших тестов. Ответ форме при этом обычный,
+    # чтобы проверять всю цепочку целиком.
+    if digits[-10:].startswith("000"):
+        api("sendMessage", chat_id=FALLBACK_CHAT, parse_mode="HTML",
+            text=(f"🧪 <b>Тестовая заявка с сайта</b> (в группу не отправлена)\n"
+                  f"Телефон: <code>{phone}</code>\nСтраница: {page or '—'}\n{when}"))
+        return _cors(jsonify(ok=True, test=True), origin)
+
     text = (
         "🌐 <b>ЗАЯВКА С САЙТА</b>\n\n"
         f"<b>Имя:</b> {name or 'не указано'}\n"
@@ -1159,7 +1168,7 @@ def site_lead():
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-08-26-v8-site-lead-form"
+VERSION = "2026-08-26-v9-site-lead-form-no-test-spam"
 
 
 @app.route("/health")
