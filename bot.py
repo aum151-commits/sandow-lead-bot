@@ -45,6 +45,32 @@ HOOK_SECRET = os.environ.get("HOOK_SECRET", "sandow").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
 MSK = timezone(timedelta(hours=3))
 
+# Ольга 30.08.2026: уведомления и напоминания о открытом чате будили людей
+# ночью. С 22:00 до 10:00 в группу заявок не шлём — откладываем до 10:00.
+QUIET_FROM = 22
+QUIET_TO = 10
+
+
+def is_quiet(now=None):
+    now = now or datetime.now(MSK)
+    return now.hour >= QUIET_FROM or now.hour < QUIET_TO
+
+
+def seconds_until_morning(now=None):
+    now = now or datetime.now(MSK)
+    morning = now.replace(hour=QUIET_TO, minute=0, second=0, microsecond=0)
+    if morning <= now:
+        morning += timedelta(days=1)
+    return max(1, (morning - now).total_seconds())
+
+
+def send_or_defer(send_fn):
+    """Отправляет сразу, а в тихие часы (22:00-10:00) — откладывает до 10:00."""
+    if is_quiet():
+        threading.Timer(seconds_until_morning(), send_fn).start()
+    else:
+        send_fn()
+
 # 1С:Фитнес клуб принимает заявки тем же вебхуком, что и формы Тильды: обычная
 # форма, не JSON. Адрес содержит секретный идентификатор, поэтому живёт только
 # в переменных сервиса. Пусто — отправка выключена, заявка всё равно идёт в группу.
@@ -498,23 +524,29 @@ def bridge_on(chat_id, message_id=None, user=None):
         # Уведомление с подтверждением: пока никто не нажал «Беру» — бот
         # напоминает через 30 и 60 минут. «Прозевать» становится невозможно.
         ack_key = f"ack:{chat_id}:{int(time.time())}"
-        send_to_orders(parse_mode="HTML",
-            text=(f"💬 <b>Открыл чат клуба</b> ({seg})\n"
-                  f"<b>{who}</b> · {uname}{pline}\n"
-                  "Переписка — в 1С, вкладка Телеграм. Кто смотрит — нажмите «Беру»."),
-            reply_markup=kb([[("✅ Беру", ack_key)]]))
+
+        def _send_open_notice():
+            send_to_orders(parse_mode="HTML",
+                text=(f"💬 <b>Открыл чат клуба</b> ({seg})\n"
+                      f"<b>{who}</b> · {uname}{pline}\n"
+                      "Переписка — в 1С, вкладка Телеграм. Кто смотрит — нажмите «Беру»."),
+                reply_markup=kb([[("✅ Беру", ack_key)]]))
+        send_or_defer(_send_open_notice)
 
         def _remind(round_no, w=who, p=pline, k=ack_key):
             with LOCK:
                 if STATE.get(k):
                     return              # уже взяли в работу
-            mark = "⏰" if round_no == 1 else "⚠️ ВТОРОЕ НАПОМИНАНИЕ"
-            send_to_orders(parse_mode="HTML",
-                text=(f"{mark} <b>Проверьте вкладку Телеграм в 1С</b> — "
-                      f"чат открывал: <b>{w}</b>{p}"),
-                reply_markup=kb([[("✅ Беру", k)]]))
-            if round_no == 1:
-                threading.Timer(1800, _remind, args=(2,)).start()
+
+            def _do_send():
+                mark = "⏰" if round_no == 1 else "⚠️ ВТОРОЕ НАПОМИНАНИЕ"
+                send_to_orders(parse_mode="HTML",
+                    text=(f"{mark} <b>Проверьте вкладку Телеграм в 1С</b> — "
+                          f"чат открывал: <b>{w}</b>{p}"),
+                    reply_markup=kb([[("✅ Беру", k)]]))
+                if round_no == 1:
+                    threading.Timer(1800, _remind, args=(2,)).start()
+            send_or_defer(_do_send)
         threading.Timer(1800, _remind, args=(1,)).start()
         # если человек не тапнет кнопку, а напишет прямо здесь — мост подхватит:
         # сообщение уйдёт в группу заявок, менеджер ответит реплаем
