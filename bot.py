@@ -857,6 +857,98 @@ def too_soon(uid):
         return False
 
 
+# --------------------------------------------------- отметки из чата продаж
+#
+# Менеджеры отмечают в чате «Отдел продаж SF» состоявшиеся встречи (плюсик и
+# телефон) и продажи (телефон и «НК» либо «Продление»). По этим отметкам
+# считается воронка: дошёл ли гость и купил ли.
+#
+# Раньше отметки собирал компьютер Ольги, опрашивая бота каждые 10 минут.
+# Значит при выключенном ноутбуке дольше суток они терялись безвозвратно —
+# Telegram хранит непрочитанное только сутки. Здесь их принимает бот на
+# сервере: мгновенно и независимо ни от ноутбука, ни от расписаний.
+#
+# Сырой текст чата не сохраняется намеренно — там обсуждают деньги и людей.
+# В журнал идут только телефон, тип отметки и кто отметил.
+
+SALES_CHAT_TITLE = os.environ.get("SALES_CHAT_TITLE", "Отдел продаж SF").strip()
+MARKS_REPO = os.environ.get("MARKS_REPO", "aum151-commits/sandow-automation").strip()
+MARKS_TOKEN = os.environ.get("MARKS_REPO_TOKEN", "").strip()
+
+_PHONE_RE = re.compile(r"(?:\+7|8|7)?[\s\-(]*(\d{3})[\s\-)]*(\d{3})[\s\-]*(\d{2})[\s\-]*(\d{2})")
+_NK_RE = re.compile(r"\bНК\b", re.IGNORECASE)
+_RENEWAL_RE = re.compile(r"продлени", re.IGNORECASE)
+
+
+def _append_to_repo(path, line):
+    """Дописывает строку в журнал внутри приватного репозитория.
+
+    Файловая система сервера здесь не годится: Render перезапускает контейнер
+    и всё, что не в репозитории, пропадает.
+    """
+    if not MARKS_TOKEN:
+        print("[отметки] нет токена репозитория — отметка не сохранена", flush=True)
+        return
+    head = {"Authorization": f"Bearer {MARKS_TOKEN}",
+            "Accept": "application/vnd.github+json"}
+    url = f"https://api.github.com/repos/{MARKS_REPO}/contents/{path}"
+    try:
+        was = requests.get(url, headers=head, timeout=25)
+        body = {"message": "Отметка из чата отдела продаж"}
+        if was.status_code == 200:
+            old = base64.b64decode(was.json()["content"]).decode("utf-8")
+            body["sha"] = was.json()["sha"]
+        else:
+            old = ""
+        body["content"] = base64.b64encode((old + line).encode("utf-8")).decode()
+        r = requests.put(url, headers=head, json=body, timeout=30)
+        if r.status_code not in (200, 201):
+            print(f"[отметки] журнал не обновлён: {r.status_code}", flush=True)
+    except Exception as exc:
+        print(f"[отметки] сбой записи: {exc}", flush=True)
+
+
+def mark_from_sales_chat(msg):
+    """Разбирает отметку менеджера. Возвращает True, если сообщение из чата
+    продаж и дальше его обрабатывать не нужно."""
+    chat = msg.get("chat", {})
+    if chat.get("title") != SALES_CHAT_TITLE:
+        return False
+
+    text = msg.get("text") or msg.get("caption") or ""
+    phones = ["".join(m) for m in _PHONE_RE.findall(text)]
+    if not phones:
+        return True  # это чат продаж, но не отметка — просто молчим
+
+    nk = bool(_NK_RE.search(text))
+    renewal = bool(_RENEWAL_RE.search(text))
+    meeting = "+" in text
+    if not (nk or renewal or meeting):
+        return True
+
+    sender = msg.get("from", {})
+    who = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))
+    base = {
+        "marked_at": datetime.fromtimestamp(msg.get("date", 0), timezone.utc).isoformat(),
+        "reporter": who,
+        "message_id": msg.get("message_id"),
+        "source": "бот в чате",
+    }
+
+    if nk or renewal:
+        category = "НК" if nk else "Продление"
+        rows = "".join(json.dumps({"phone": p, "category": category, **base},
+                                  ensure_ascii=False) + "\n" for p in phones)
+        _append_to_repo("data/conversions/sales_marks.jsonl", rows)
+        print(f"[отметки] продажа ({category}): {len(phones)} тел.", flush=True)
+    elif meeting:
+        rows = "".join(json.dumps({"phone": p, **base}, ensure_ascii=False) + "\n"
+                       for p in phones)
+        _append_to_repo("data/conversions/meetings.jsonl", rows)
+        print(f"[отметки] встреча: {len(phones)} тел.", flush=True)
+    return True
+
+
 # ------------------------------------------------------------------- webhook
 
 @app.route(f"/tg/{HOOK_SECRET}", methods=["POST"])
@@ -874,6 +966,10 @@ def handle(upd):
         return on_button(upd["callback_query"])
     msg = upd.get("message") or upd.get("edited_message")
     if msg:
+        # Отметки менеджеров из рабочего чата — не диалог с клиентом,
+        # обрабатываются отдельно и дальше не идут.
+        if mark_from_sales_chat(msg):
+            return
         return on_message(msg)
 
 
