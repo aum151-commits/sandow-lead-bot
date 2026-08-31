@@ -891,6 +891,24 @@ MARKS_TOKEN = os.environ.get("MARKS_REPO_TOKEN", "").strip()
 _PHONE_RE = re.compile(r"\d[\d\s\-()]{8,18}\d")
 
 
+def _tail_after_phone(text):
+    """Часть сообщения после последнего телефона.
+
+    Правило чата (Ольга, 31.08.2026): фамилия и имя клиента идут ДО телефона,
+    а свои — менеджер и эксперт — после телефона и номера контракта, в самом
+    низу. Значит искать их надо только в хвосте: тогда «Продление Петрова
+    Мария 8916…» не превратит клиентку Марию в менеджера Спиридонову.
+
+    Если телефона нет, возвращаем весь текст — хуже, чем было, не станет.
+    """
+    последний = None
+    for m in _PHONE_RE.finditer(text):
+        цифры = re.sub(r"\D", "", m.group(0))
+        if len(цифры) >= 10 and цифры[-10:].startswith("9"):
+            последний = m
+    return text[последний.end():] if последний else text
+
+
 def _phones(text):
     """Номера из сообщения, приведённые к десяти цифрам.
 
@@ -983,7 +1001,7 @@ _MANAGER_FULL = {
 }
 
 _STAFF_CACHE = {"когда": 0.0, "менеджеры": None, "короткие": None,
-                "полные": None, "тренеры": None}
+                "полные": None, "тренеры": None, "по_телеграму": None}
 
 
 def _refresh_staff():
@@ -1015,6 +1033,12 @@ def _refresh_staff():
                 полные[m["имя"].lower()] = фамилия
             for зовут in (m.get("зовут") or []):
                 короткие[зовут.lower()] = фамилия
+            # прямая привязка телеграм-аккаунта к фамилии — самый точный путь
+            for ид in (m.get("телеграм") or []):
+                _STAFF_CACHE.setdefault("по_телеграму", {})
+                if _STAFF_CACHE["по_телеграму"] is None:
+                    _STAFF_CACHE["по_телеграму"] = {}
+                _STAFF_CACHE["по_телеграму"][str(ид)] = фамилия
         if менеджеры:
             _STAFF_CACHE["менеджеры"] = менеджеры
             _STAFF_CACHE["короткие"] = короткие
@@ -1044,6 +1068,59 @@ def _channel(text):
     return ""
 
 
+def _manager_by_author(sender):
+    """Менеджер по автору сообщения.
+
+    Правило чата (Ольга, 31.08.2026): встречу отмечает тот, кто её и провёл,
+    поэтому своё имя внизу он не подписывает — автор сообщения и есть
+    менеджер. Сопоставляем по имени и нику в Telegram.
+    """
+    _refresh_staff()
+    фамилии = _STAFF_CACHE["менеджеры"] or _MANAGERS
+    короткие = _STAFF_CACHE["короткие"] or _MANAGER_SHORT
+    полные = _STAFF_CACHE["полные"] or _MANAGER_FULL
+    привязки = _STAFF_CACHE["по_телеграму"] or {}
+
+    ид = str(sender.get("id") or "")
+    if ид in привязки:
+        return привязки[ид]
+
+    подпись = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name"),
+                                     sender.get("username")])).lower()
+    if not подпись:
+        return ""
+    for фамилия in фамилии:
+        if фамилия.lower()[:-1] in подпись:
+            return фамилия
+    for зовут, фамилия in короткие.items():
+        if re.search(rf"\b{зовут}\b", подпись):
+            return фамилия
+    for имя, фамилия in полные.items():
+        if re.search(rf"\b{имя}\b", подпись):
+            return фамилия
+    return ""
+
+
+def _remember_author(sender):
+    """Копим, кто пишет в чат: id, ник и имя.
+
+    Нужно, чтобы привязать телеграм-аккаунты к фамилиям менеджеров один раз
+    и дальше не гадать по имени в профиле — там бывает что угодно.
+    """
+    ид = str(sender.get("id") or "")
+    if not ид or not MARKS_TOKEN:
+        return
+    запись = {
+        "id": ид,
+        "username": sender.get("username", ""),
+        "имя": " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")])),
+        "узнан_как": _manager_by_author(sender),
+    }
+    _append_to_repo("data/staff/authors.jsonl",
+                    json.dumps(запись, ensure_ascii=False) + "\n",
+                    replaces_key=f'"id": "{ид}"')
+
+
 def _manager(text):
     """Кто из отдела продаж указан в отметке.
 
@@ -1055,26 +1132,18 @@ def _manager(text):
     короткие = _STAFF_CACHE["короткие"] or _MANAGER_SHORT
     полные = _STAFF_CACHE["полные"] or _MANAGER_FULL
 
-    низкий = text.lower()
+    # ищем только после телефона: до него идут фамилия и имя клиента
+    низкий = _tail_after_phone(text).lower()
 
-    # 1. фамилия — самый надёжный признак
     for фамилия in фамилии:
         if фамилия.lower()[:-1] in низкий:
             return фамилия
-
-    # 2. короткая форма — так зовут только своих
     for зовут, фамилия in короткие.items():
         if re.search(rf"\b{зовут}\b", низкий):
             return фамилия
-
-    # 3. полное имя — только последним словом, где и ставят подпись.
-    #    Не предпоследним: «Продление Петрова Мария 89165554433» — здесь
-    #    Мария это клиентка, а подписи нет вовсе.
-    слова = низкий.strip().split()
-    if слова:
-        последнее = re.sub(r"[^а-яё]", "", слова[-1])
-        if последнее in полные:
-            return полные[последнее]
+    for имя, фамилия in полные.items():
+        if re.search(rf"\b{имя}\b", низкий):
+            return фамилия
     return ""
 
 
@@ -1088,7 +1157,8 @@ def _expert(text, кроме=""):
     _refresh_staff()
     список = _STAFF_CACHE["тренеры"] or _TRAINERS
 
-    низкий = text.lower()
+    # как и менеджер, эксперт указывается после телефона — до него клиент
+    низкий = _tail_after_phone(text).lower()
     for полное in список:
         имя, _, фамилия = полное.partition(" ")
         if фамилия and фамилия.lower()[:-1] in низкий:   # без последней буквы: падежи
@@ -1098,12 +1168,12 @@ def _expert(text, кроме=""):
         if имя == кроме:
             continue   # это имя гостя, а не тренера
         одноимённых = sum(1 for t in список if t.split()[0] == имя)
-        if одноимённых == 1 and re.search(rf"\b{имя}\b", text, re.IGNORECASE):
+        if одноимённых == 1 and re.search(rf"\b{имя.lower()}\b", низкий):
             return полное
     return ""
 
 
-def _append_to_repo(path, line, replaces_message_id=None):
+def _append_to_repo(path, line, replaces_message_id=None, replaces_key=None):
     """Пишет строку в журнал внутри приватного репозитория.
 
     Файловая система сервера здесь не годится: Render перезапускает контейнер
@@ -1128,8 +1198,12 @@ def _append_to_repo(path, line, replaces_message_id=None):
         else:
             old = ""
 
+        метка = None
         if replaces_message_id is not None:
             метка = f'"message_id": {replaces_message_id}'
+        elif replaces_key:
+            метка = replaces_key
+        if метка:
             строки = [s for s in old.splitlines() if s.strip() and метка not in s]
             old = ("\n".join(строки) + "\n") if строки else ""
 
@@ -1165,6 +1239,7 @@ def mark_from_sales_chat(msg, правка=False):
 
     sender = msg.get("from", {})
     who = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))
+    _remember_author(sender)   # копим, кто пишет в чат, чтобы привязать аккаунты
     base = {
         "marked_at": datetime.fromtimestamp(msg.get("date", 0), timezone.utc).isoformat(),
         "reporter": who,
@@ -1197,8 +1272,9 @@ def mark_from_sales_chat(msg, правка=False):
             "kind": вид,
             # тренера иногда дописывают в конце строки продажи
             "expert": _expert(text),
-            # оформлял один, а продажа может быть записана на другого
-            "manager": _manager(text),
+            # в продаже менеджера подписывают явно; если не подписан —
+            # берём автора сообщения, как и во встрече
+            "manager": _manager(text) or _manager_by_author(sender),
             "channel": _channel(text),
             "edited": bool(правка),
             **base,
@@ -1208,12 +1284,16 @@ def mark_from_sales_chat(msg, правка=False):
               f"{вид or 'вид не указан'}, {len(phones)} тел.", flush=True)
     else:
         гость = встреча.group(1)
+        # Встречу отмечает тот, кто её провёл, — своё имя он не подписывает.
+        # Поэтому менеджер здесь берётся из автора сообщения, а из текста —
+        # только если он всё же подписался.
+        менеджер = _manager(text) or _manager_by_author(sender)
         rows = "".join(json.dumps({
             "phone": p,
             "guest": гость,
-            # кто вёл: по нему считается, после чьих консультаций покупают чаще
+            # эксперт — он же тренер, он же фитнес-эксперт: подписывается внизу
             "expert": _expert(text, кроме=гость),
-            "manager": _manager(text),
+            "manager": менеджер,
             "channel": _channel(text),
             # подарочная вводная тренировка — отдельная воронка
             "vpt": bool(_VPT_RE.search(text)),
