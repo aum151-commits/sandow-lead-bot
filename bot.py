@@ -865,12 +865,18 @@ def too_soon(uid):
 #
 # Раньше отметки собирал компьютер Ольги, опрашивая бота каждые 10 минут.
 # Значит при выключенном ноутбуке дольше суток они терялись безвозвратно —
-# Telegram хранит непрочитанное только сутки. Здесь их принимает бот на
-# сервере: мгновенно и независимо ни от ноутбука, ни от расписаний.
+# Telegram хранит непрочитанное только сутки. Теперь их принимает сервер:
+# мгновенно и независимо ни от ноутбука, ни от расписаний.
+#
+# ВАЖНО: это ОТДЕЛЬНЫЙ бот-читатель, у него свой адрес приёма (/marks/...).
+# Клиентского бота в рабочий чат добавлять нельзя — он шлёт туда заявки, и
+# получились бы дубли и путаница ролей (прямое замечание Ольги 31.08.2026).
+# Бот-читатель в чате только слушает и не пишет ни слова.
 #
 # Сырой текст чата не сохраняется намеренно — там обсуждают деньги и людей.
 # В журнал идут только телефон, тип отметки и кто отметил.
 
+MARKS_SECRET = os.environ.get("MARKS_HOOK_SECRET", "").strip()
 SALES_CHAT_TITLE = os.environ.get("SALES_CHAT_TITLE", "Отдел продаж SF").strip()
 MARKS_REPO = os.environ.get("MARKS_REPO", "aum151-commits/sandow-automation").strip()
 MARKS_TOKEN = os.environ.get("MARKS_REPO_TOKEN", "").strip()
@@ -949,6 +955,25 @@ def mark_from_sales_chat(msg):
     return True
 
 
+@app.route("/marks/<секрет>", methods=["POST"])
+def marks_hook(секрет):
+    """Приём сообщений бота-читателя из чата отдела продаж.
+
+    Отдельный адрес и отдельный бот: клиентский поток и рабочий чат не должны
+    пересекаться. Отвечать в чат этот путь не умеет вовсе — только слушает.
+    """
+    if not MARKS_SECRET or секрет != MARKS_SECRET:
+        return jsonify(ok=False), 404
+    upd = request.get_json(force=True, silent=True) or {}
+    msg = upd.get("message") or upd.get("edited_message")
+    if msg:
+        try:
+            mark_from_sales_chat(msg)
+        except Exception as exc:
+            print(f"[отметки] {exc}", flush=True)
+    return jsonify(ok=True)
+
+
 # ------------------------------------------------------------------- webhook
 
 @app.route(f"/tg/{HOOK_SECRET}", methods=["POST"])
@@ -966,10 +991,6 @@ def handle(upd):
         return on_button(upd["callback_query"])
     msg = upd.get("message") or upd.get("edited_message")
     if msg:
-        # Отметки менеджеров из рабочего чата — не диалог с клиентом,
-        # обрабатываются отдельно и дальше не идут.
-        if mark_from_sales_chat(msg):
-            return
         return on_message(msg)
 
 
