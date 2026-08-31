@@ -922,18 +922,64 @@ _MEETING_RE = re.compile(r"(?:^|\n)\s*\+\s*([А-ЯЁA-Z][а-яёa-z\-]+)")
 _SALE_RE = re.compile(r"[$＄]\s*([\d\s]{3,12})")
 _PAYMENT_RE = re.compile(r"\b(нал|qr|б/н|бн|безнал|карт\w*|перевод\w*|рассрочк\w*)\b",
                          re.IGNORECASE)
-# Тип членства пишут аббревиатурой (ПЧК, БЧК и подобные) — список не
-# фиксируем: любые 2–5 заглавных букв рядом с суммой, чтобы новые виды
-# абонементов не выпадали из учёта молча.
-_MEMBERSHIP_RE = re.compile(r"\b([А-ЯЁ]{2,5})\b")
-_NOT_MEMBERSHIP = {"ФИО", "ТЕЛ", "QR", "СПБ", "МСК", "НДС"}
+
+# Кто купил (со слов Ольги 31.08.2026):
+#   НК — новый клиент, вчерашний ПЧК (потенциальный член клуба);
+#   Продление — платит действующий член клуба или БЧК (бывший член клуба);
+#   Возобновление — иногда пишут про БЧК вместо продления, реже.
+_KIND_NK = re.compile(r"\bНК\b", re.IGNORECASE)
+_KIND_RENEWAL = re.compile(r"продлени", re.IGNORECASE)
+_KIND_RETURN = re.compile(r"возобновлени", re.IGNORECASE)
+_PCHK_RE = re.compile(r"\bПЧК\b", re.IGNORECASE)
+_BCHK_RE = re.compile(r"\bБЧК\b", re.IGNORECASE)
+
+# Вводная персональная тренировка — подарочная, всегда с именем эксперта.
+# По ней считается, насколько хорошо тренер доводит гостя до покупки.
+_VPT_RE = re.compile(r"\bВПТ\b", re.IGNORECASE)
+
+# Кто вёл консультацию или тренировку. Список с сайта клуба; пополняется
+# без выкладки кода — переменной TRAINERS через запятую.
+_TRAINERS = [
+    "Дарья Салихова", "Дмитрий Анников", "Евгений Леонтьев", "Ева Каймовская",
+    "Александр Купричев", "Юрий Яковлев", "Георгий Шарангия", "Наталья Пожилова",
+    "Сергей Кочубей", "Виктор Савельев", "Кристина Девакова", "Александр Белодурин",
+    "Сергей Зайцев", "Денис Бандурин", "Виктория Устинова", "Нурлан Курбанов",
+    "Денис Сандригайло", "Нина Ипатова", "Александр Квасков",
+]
+_TRAINERS += [t.strip() for t in os.environ.get("TRAINERS", "").split(",") if t.strip()]
 
 
-def _append_to_repo(path, line):
-    """Дописывает строку в журнал внутри приватного репозитория.
+def _expert(text, кроме=""):
+    """Кто вёл встречу или тренировку.
+
+    Ищем по фамилиям — они уникальнее имён: Александров в списке трое, а
+    Купричев один. Имя проверяем только если оно встречается у одного
+    тренера, иначе непонятно, о ком речь.
+    """
+    низкий = text.lower()
+    for полное in _TRAINERS:
+        имя, _, фамилия = полное.partition(" ")
+        if фамилия and фамилия.lower()[:-1] in низкий:   # без последней буквы: падежи
+            return полное
+    for полное in _TRAINERS:
+        имя = полное.split()[0]
+        if имя == кроме:
+            continue   # это имя гостя, а не тренера
+        одноимённых = sum(1 for t in _TRAINERS if t.split()[0] == имя)
+        if одноимённых == 1 and re.search(rf"\b{имя}\b", text, re.IGNORECASE):
+            return полное
+    return ""
+
+
+def _append_to_repo(path, line, replaces_message_id=None):
+    """Пишет строку в журнал внутри приватного репозитория.
 
     Файловая система сервера здесь не годится: Render перезапускает контейнер
     и всё, что не в репозитории, пропадает.
+
+    replaces_message_id — если менеджер поправил своё сообщение (руководство
+    заметило ошибку и написало обратную связь), старую запись надо заменить,
+    а не добавить вторую. Иначе одна продажа считалась бы дважды.
     """
     if not MARKS_TOKEN:
         print("[отметки] нет токена репозитория — отметка не сохранена", flush=True)
@@ -949,6 +995,12 @@ def _append_to_repo(path, line):
             body["sha"] = was.json()["sha"]
         else:
             old = ""
+
+        if replaces_message_id is not None:
+            метка = f'"message_id": {replaces_message_id}'
+            строки = [s for s in old.splitlines() if s.strip() and метка not in s]
+            old = ("\n".join(строки) + "\n") if строки else ""
+
         body["content"] = base64.b64encode((old + line).encode("utf-8")).decode()
         r = requests.put(url, headers=head, json=body, timeout=30)
         if r.status_code not in (200, 201):
@@ -957,9 +1009,14 @@ def _append_to_repo(path, line):
         print(f"[отметки] сбой записи: {exc}", flush=True)
 
 
-def mark_from_sales_chat(msg):
+def mark_from_sales_chat(msg, правка=False):
     """Разбирает отметку менеджера. Возвращает True, если сообщение из чата
-    продаж и дальше его обрабатывать не нужно."""
+    продаж и дальше его обрабатывать не нужно.
+
+    правка=True — сообщение отредактировали. Так бывает часто: руководство
+    видит ошибку, пишет обратную связь, менеджер исправляет своё сообщение.
+    Тогда прежнюю запись заменяем, а не добавляем ещё одну.
+    """
     chat = msg.get("chat", {})
     if chat.get("title") != SALES_CHAT_TITLE:
         return False
@@ -983,32 +1040,52 @@ def mark_from_sales_chat(msg):
         "source": "бот в чате",
     }
 
+    заменить = msg.get("message_id") if правка else None
+
     if продажа:
         сумма = int(re.sub(r"\D", "", продажа.group(1)) or 0)
         оплата = _PAYMENT_RE.search(text)
         # ФИО клиента не сохраняем: для воронки хватает телефона, а лишние
         # персональные данные в журнале — лишний риск
-        членство = ""
-        for кандидат in _MEMBERSHIP_RE.findall(text):
-            if кандидат not in _NOT_MEMBERSHIP:
-                членство = кандидат
-                break
+
+        # кто купил: новый клиент или тот, кто уже был в клубе
+        if _KIND_NK.search(text) or _PCHK_RE.search(text):
+            вид = "НК"
+        elif _KIND_RETURN.search(text):
+            вид = "Возобновление"
+        elif _KIND_RENEWAL.search(text) or _BCHK_RE.search(text):
+            вид = "Продление"
+        else:
+            вид = ""   # менеджер не указал — пусть будет видно, а не выдумано
+
         rows = "".join(json.dumps({
             "phone": p,
             "amount": сумма,
             "payment": (оплата.group(1).lower() if оплата else ""),
-            "membership": членство,
+            "kind": вид,
+            "expert": _expert(text),
+            "edited": bool(правка),
             **base,
         }, ensure_ascii=False) + "\n" for p in phones)
-        _append_to_repo("data/conversions/sales_marks.jsonl", rows)
-        print(f"[отметки] продажа: {сумма} ₽, {len(phones)} тел., тип «{членство}»",
-              flush=True)
+        _append_to_repo("data/conversions/sales_marks.jsonl", rows, заменить)
+        print(f"[отметки] продажа{' (правка)' if правка else ''}: {сумма} ₽, "
+              f"{вид or 'вид не указан'}, {len(phones)} тел.", flush=True)
     else:
-        rows = "".join(json.dumps({"phone": p, "guest": встреча.group(1), **base},
-                                  ensure_ascii=False) + "\n" for p in phones)
-        _append_to_repo("data/conversions/meetings.jsonl", rows)
-        print(f"[отметки] встреча: гость «{встреча.group(1)}», {len(phones)} тел.",
-              flush=True)
+        гость = встреча.group(1)
+        rows = "".join(json.dumps({
+            "phone": p,
+            "guest": гость,
+            # кто вёл: по нему считается, после чьих консультаций покупают чаще
+            "expert": _expert(text, кроме=гость),
+            # подарочная вводная тренировка — отдельная воронка
+            "vpt": bool(_VPT_RE.search(text)),
+            "edited": bool(правка),
+            **base,
+        }, ensure_ascii=False) + "\n" for p in phones)
+        _append_to_repo("data/conversions/meetings.jsonl", rows, заменить)
+        print(f"[отметки] {'ВПТ' if _VPT_RE.search(text) else 'встреча'}"
+              f"{' (правка)' if правка else ''}: гость «{гость}», "
+              f"эксперт «{_expert(text, кроме=гость) or 'не указан'}»", flush=True)
     return True
 
 
@@ -1048,6 +1125,7 @@ def marks_hook(secret):
     if not MARKS_SECRET or secret != MARKS_SECRET:
         return jsonify(ok=False), 404
     upd = request.get_json(force=True, silent=True) or {}
+    правка = "edited_message" in upd
     msg = upd.get("message") or upd.get("edited_message")
     if msg:
         # Отметка в журнале о самом факте прихода: название чата и тип, без
@@ -1057,7 +1135,7 @@ def marks_hook(secret):
         print(f"[приём] сообщение из «{чат.get('title') or 'лички'}» "
               f"({чат.get('type')}), ожидаем «{SALES_CHAT_TITLE}»", flush=True)
         try:
-            if not mark_from_sales_chat(msg):
+            if not mark_from_sales_chat(msg, правка=правка):
                 # не чат продаж — значит личка: выгрузка 1С или что-то ещё
                 if queue_document(msg):
                     чат = msg.get("chat", {}).get("id")
