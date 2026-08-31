@@ -948,6 +948,42 @@ _TRAINERS = [
 ]
 _TRAINERS += [t.strip() for t in os.environ.get("TRAINERS", "").split(",") if t.strip()]
 
+# Менеджеры отдела продаж — из журнала звонков 1С. Нужны, чтобы отличить
+# продавца от тренера: в одной строке могут стоять оба, а бывает и так,
+# что оформлял один менеджер, а продажа записана на другого.
+_MANAGERS = [
+    "Севоян", "Бежан", "Боровкова", "Разуева", "Рыбалко", "Ефимов",
+    "Зиновьева", "Капанадзе", "Спиридонова", "Тоганидзе", "Плотникова",
+]
+_MANAGERS += [m.strip() for m in os.environ.get("MANAGERS", "").split(",") if m.strip()]
+
+# Откуда пришёл человек — менеджеры помечают это словом в отметке.
+# Тонкость от Ольги: тут бывают ошибки, поэтому канал сверяется со звонками
+# при расчёте, а не принимается на веру. Рекламный источник (Яндекс, карты,
+# 2ГИС) здесь не появится — менеджеры его попросту не знают.
+_CHANNELS = (
+    ("входящий звонок", re.compile(r"\bВЗ\b|входящ\w*\s+звон", re.IGNORECASE)),
+    ("сарафан", re.compile(r"сарафан|рекомендаци", re.IGNORECASE)),
+    ("заявка", re.compile(r"\bзаявк\w*", re.IGNORECASE)),
+    ("входящий гость", re.compile(r"\bгост\w*", re.IGNORECASE)),
+)
+
+
+def _channel(text):
+    for название, шаблон in _CHANNELS:
+        if шаблон.search(text):
+            return название
+    return ""
+
+
+def _manager(text):
+    """Кто из отдела продаж указан в отметке — по фамилии, с учётом падежей."""
+    низкий = text.lower()
+    for фамилия in _MANAGERS:
+        if фамилия.lower()[:-1] in низкий:
+            return фамилия
+    return ""
+
 
 def _expert(text, кроме=""):
     """Кто вёл встречу или тренировку.
@@ -1063,7 +1099,11 @@ def mark_from_sales_chat(msg, правка=False):
             "amount": сумма,
             "payment": (оплата.group(1).lower() if оплата else ""),
             "kind": вид,
+            # тренера иногда дописывают в конце строки продажи
             "expert": _expert(text),
+            # оформлял один, а продажа может быть записана на другого
+            "manager": _manager(text),
+            "channel": _channel(text),
             "edited": bool(правка),
             **base,
         }, ensure_ascii=False) + "\n" for p in phones)
@@ -1077,6 +1117,8 @@ def mark_from_sales_chat(msg, правка=False):
             "guest": гость,
             # кто вёл: по нему считается, после чьих консультаций покупают чаще
             "expert": _expert(text, кроме=гость),
+            "manager": _manager(text),
+            "channel": _channel(text),
             # подарочная вводная тренировка — отдельная воронка
             "vpt": bool(_VPT_RE.search(text)),
             "edited": bool(правка),
