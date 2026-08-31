@@ -995,6 +995,12 @@ def marks_hook(secret):
     upd = request.get_json(force=True, silent=True) or {}
     msg = upd.get("message") or upd.get("edited_message")
     if msg:
+        # Отметка в журнале о самом факте прихода: название чата и тип, без
+        # текста. Без неё непонятно, доходят ли сообщения из группы вообще —
+        # а это первое, что нужно знать, если отметки перестали появляться.
+        чат = msg.get("chat", {})
+        print(f"[приём] сообщение из «{чат.get('title') or 'лички'}» "
+              f"({чат.get('type')}), ожидаем «{SALES_CHAT_TITLE}»", flush=True)
         try:
             if not mark_from_sales_chat(msg):
                 # не чат продаж — значит личка: выгрузка 1С или что-то ещё
