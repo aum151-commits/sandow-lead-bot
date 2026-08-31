@@ -1227,6 +1227,11 @@ def mark_from_sales_chat(msg, правка=False):
     if chat.get("title") != SALES_CHAT_TITLE:
         return False
 
+    # Автора запоминаем при любом сообщении, а не только при отметке: так
+    # телеграм-аккаунты менеджеров привязываются к фамилиям за день, без
+    # пересылок куда-то на сторону.
+    _remember_author(msg.get("from", {}))
+
     text = msg.get("text") or msg.get("caption") or ""
     phones = _phones(text)
     if not phones:
@@ -1239,7 +1244,6 @@ def mark_from_sales_chat(msg, правка=False):
 
     sender = msg.get("from", {})
     who = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))
-    _remember_author(sender)   # копим, кто пишет в чат, чтобы привязать аккаунты
     base = {
         "marked_at": datetime.fromtimestamp(msg.get("date", 0), timezone.utc).isoformat(),
         "reporter": who,
