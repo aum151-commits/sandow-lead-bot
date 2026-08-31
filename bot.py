@@ -1235,11 +1235,17 @@ def mark_from_sales_chat(msg, правка=False):
     text = msg.get("text") or msg.get("caption") or ""
     phones = _phones(text)
     if not phones:
+        # 31.08.2026: раньше молчали совсем — за день пришли десятки
+        # сообщений из чата продаж, но ни одно не превратилось в отметку,
+        # и разобраться, почему, было не по чему. Короткий обрезок текста —
+        # ровно то, что уже видно в чате, лишнего не пишем.
+        print(f"[отметки] без телефона, пропущено: {text[:100]!r}", flush=True)
         return True  # это чат продаж, но не отметка — просто молчим
 
     продажа = _SALE_RE.search(text)
     встреча = _MEETING_RE.search(text)
     if not (продажа or встреча):
+        print(f"[отметки] телефон есть, но нет $ или + в начале строки: {text[:100]!r}", flush=True)
         return True
 
     sender = msg.get("from", {})
