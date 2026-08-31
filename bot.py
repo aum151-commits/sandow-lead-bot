@@ -877,6 +877,8 @@ def too_soon(uid):
 # В журнал идут только телефон, тип отметки и кто отметил.
 
 MARKS_SECRET = os.environ.get("MARKS_HOOK_SECRET", "").strip()
+# токен служебного бота — нужен, чтобы подтвердить приём выгрузки отправителю
+MARKS_BOT_TOKEN = os.environ.get("MARKS_BOT_TOKEN", "").strip()
 SALES_CHAT_TITLE = os.environ.get("SALES_CHAT_TITLE", "Отдел продаж SF").strip()
 MARKS_REPO = os.environ.get("MARKS_REPO", "aum151-commits/sandow-automation").strip()
 MARKS_TOKEN = os.environ.get("MARKS_REPO_TOKEN", "").strip()
@@ -955,12 +957,38 @@ def mark_from_sales_chat(msg):
     return True
 
 
+def queue_document(msg):
+    """Кладёт присланную выгрузку 1С в очередь для компьютера.
+
+    Сам файл не скачиваем: у Telegram он хранится долго, достаточно запомнить
+    file_id. Компьютер, когда включится, заберёт очередь и скачает файлы сам.
+    Так выгрузка не теряется, даже если ноутбук выключен неделю — раньше
+    непрочитанное пропадало через сутки.
+    """
+    doc = msg.get("document")
+    if not doc:
+        return False
+    запись = {
+        "file_id": doc.get("file_id"),
+        "file_name": doc.get("file_name"),
+        "size": doc.get("file_size"),
+        "chat_id": msg.get("chat", {}).get("id"),
+        "from_id": msg.get("from", {}).get("id"),
+        "message_id": msg.get("message_id"),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _append_to_repo("data/intake/queue.jsonl",
+                    json.dumps(запись, ensure_ascii=False) + "\n")
+    print(f"[приём] файл в очереди: {doc.get('file_name')}", flush=True)
+    return True
+
+
 @app.route("/marks/<secret>", methods=["POST"])   # имя в адресе — только латиницей
 def marks_hook(secret):
-    """Приём сообщений бота-читателя из чата отдела продаж.
+    """Приём сообщений служебного бота: отметки из чата продаж и выгрузки 1С.
 
-    Отдельный адрес и отдельный бот: клиентский поток и рабочий чат не должны
-    пересекаться. Отвечать в чат этот путь не умеет вовсе — только слушает.
+    Отдельный адрес: клиентский поток сюда не попадает и не смешивается.
+    В чат отдела продаж этот путь ничего не пишет — только слушает.
     """
     if not MARKS_SECRET or secret != MARKS_SECRET:
         return jsonify(ok=False), 404
@@ -968,7 +996,18 @@ def marks_hook(secret):
     msg = upd.get("message") or upd.get("edited_message")
     if msg:
         try:
-            mark_from_sales_chat(msg)
+            if not mark_from_sales_chat(msg):
+                # не чат продаж — значит личка: выгрузка 1С или что-то ещё
+                if queue_document(msg):
+                    чат = msg.get("chat", {}).get("id")
+                    имя = (msg.get("document") or {}).get("file_name", "файл")
+                    if MARKS_BOT_TOKEN:
+                        requests.post(
+                            f"https://api.telegram.org/bot{MARKS_BOT_TOKEN}/sendMessage",
+                            data={"chat_id": чат,
+                                  "text": f"Принято: {имя}. Обработаю, как только "
+                                          f"компьютер будет на связи."},
+                            timeout=25)
         except Exception as exc:
             print(f"[отметки] {exc}", flush=True)
     return jsonify(ok=True)
