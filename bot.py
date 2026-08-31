@@ -884,8 +884,21 @@ MARKS_REPO = os.environ.get("MARKS_REPO", "aum151-commits/sandow-automation").st
 MARKS_TOKEN = os.environ.get("MARKS_REPO_TOKEN", "").strip()
 
 _PHONE_RE = re.compile(r"(?:\+7|8|7)?[\s\-(]*(\d{3})[\s\-)]*(\d{3})[\s\-]*(\d{2})[\s\-]*(\d{2})")
-_NK_RE = re.compile(r"\bНК\b", re.IGNORECASE)
-_RENEWAL_RE = re.compile(r"продлени", re.IGNORECASE)
+
+# Как менеджеры пишут на самом деле (со слов Ольги 31.08.2026):
+#   встреча — строка начинается с плюса и имени гостя: «+Сергей», телефон, комментарий;
+#   продажа — начинается с суммы: «$24990 нал», тип оплаты, тип членства, ФИО, телефон.
+# Раньше разбор искал «НК» и «Продление» и считал встречей любой плюс в тексте —
+# а плюс есть в каждом телефоне «+7…», из-за чего отметкой становилось что угодно.
+_MEETING_RE = re.compile(r"(?:^|\n)\s*\+\s*([А-ЯЁA-Z][а-яёa-z\-]+)")
+_SALE_RE = re.compile(r"[$＄]\s*([\d\s]{3,12})")
+_PAYMENT_RE = re.compile(r"\b(нал|qr|б/н|бн|безнал|карт\w*|перевод\w*|рассрочк\w*)\b",
+                         re.IGNORECASE)
+# Тип членства пишут аббревиатурой (ПЧК, БЧК и подобные) — список не
+# фиксируем: любые 2–5 заглавных букв рядом с суммой, чтобы новые виды
+# абонементов не выпадали из учёта молча.
+_MEMBERSHIP_RE = re.compile(r"\b([А-ЯЁ]{2,5})\b")
+_NOT_MEMBERSHIP = {"ФИО", "ТЕЛ", "QR", "СПБ", "МСК", "НДС"}
 
 
 def _append_to_repo(path, line):
@@ -928,10 +941,9 @@ def mark_from_sales_chat(msg):
     if not phones:
         return True  # это чат продаж, но не отметка — просто молчим
 
-    nk = bool(_NK_RE.search(text))
-    renewal = bool(_RENEWAL_RE.search(text))
-    meeting = "+" in text
-    if not (nk or renewal or meeting):
+    продажа = _SALE_RE.search(text)
+    встреча = _MEETING_RE.search(text)
+    if not (продажа or встреча):
         return True
 
     sender = msg.get("from", {})
@@ -943,17 +955,32 @@ def mark_from_sales_chat(msg):
         "source": "бот в чате",
     }
 
-    if nk or renewal:
-        category = "НК" if nk else "Продление"
-        rows = "".join(json.dumps({"phone": p, "category": category, **base},
-                                  ensure_ascii=False) + "\n" for p in phones)
+    if продажа:
+        сумма = int(re.sub(r"\D", "", продажа.group(1)) or 0)
+        оплата = _PAYMENT_RE.search(text)
+        # ФИО клиента не сохраняем: для воронки хватает телефона, а лишние
+        # персональные данные в журнале — лишний риск
+        членство = ""
+        for кандидат in _MEMBERSHIP_RE.findall(text):
+            if кандидат not in _NOT_MEMBERSHIP:
+                членство = кандидат
+                break
+        rows = "".join(json.dumps({
+            "phone": p,
+            "amount": сумма,
+            "payment": (оплата.group(1).lower() if оплата else ""),
+            "membership": членство,
+            **base,
+        }, ensure_ascii=False) + "\n" for p in phones)
         _append_to_repo("data/conversions/sales_marks.jsonl", rows)
-        print(f"[отметки] продажа ({category}): {len(phones)} тел.", flush=True)
-    elif meeting:
-        rows = "".join(json.dumps({"phone": p, **base}, ensure_ascii=False) + "\n"
-                       for p in phones)
+        print(f"[отметки] продажа: {сумма} ₽, {len(phones)} тел., тип «{членство}»",
+              flush=True)
+    else:
+        rows = "".join(json.dumps({"phone": p, "guest": встреча.group(1), **base},
+                                  ensure_ascii=False) + "\n" for p in phones)
         _append_to_repo("data/conversions/meetings.jsonl", rows)
-        print(f"[отметки] встреча: {len(phones)} тел.", flush=True)
+        print(f"[отметки] встреча: гость «{встреча.group(1)}», {len(phones)} тел.",
+              flush=True)
     return True
 
 
