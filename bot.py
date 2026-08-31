@@ -955,14 +955,14 @@ def mark_from_sales_chat(msg):
     return True
 
 
-@app.route("/marks/<секрет>", methods=["POST"])
-def marks_hook(секрет):
+@app.route("/marks/<secret>", methods=["POST"])   # имя в адресе — только латиницей
+def marks_hook(secret):
     """Приём сообщений бота-читателя из чата отдела продаж.
 
     Отдельный адрес и отдельный бот: клиентский поток и рабочий чат не должны
     пересекаться. Отвечать в чат этот путь не умеет вовсе — только слушает.
     """
-    if not MARKS_SECRET or секрет != MARKS_SECRET:
+    if not MARKS_SECRET or secret != MARKS_SECRET:
         return jsonify(ok=False), 404
     upd = request.get_json(force=True, silent=True) or {}
     msg = upd.get("message") or upd.get("edited_message")
