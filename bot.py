@@ -1724,16 +1724,104 @@ def site_lead():
     return _cors(jsonify(ok=True), origin)
 
 
+# ------------------------------------------------ расписание облачных задач
+#
+# Зачем расписание живёт здесь, а не в GitHub. Задачи клуба выполняет GitHub
+# Actions, но время там соблюдается «по возможности»: замерено за 01.09.2026 —
+# «каждые полчаса» обернулось четырьмя запусками за сутки, «каждые 10 минут»
+# тремя. Человек, которому не перезвонили, попадал в отчёт через три часа.
+# Этот сервис живёт круглосуточно, поэтому время задаёт он, а GitHub только
+# делает работу.
+#
+# Снаружи каждые несколько минут стучится бесплатный будильник (cron-job.org)
+# на адрес /cron/<секрет>. Наружу отдан только адрес: токен GitHub остаётся
+# здесь, в переменных сервиса.
+
+CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
+GH_TOKEN = os.environ.get("GH_DISPATCH_TOKEN", "").strip()
+GH_REPO = os.environ.get("GH_REPO", "aum151-commits/sandow-lp").strip()
+
+# задача → (запускать раз в N минут, в какие часы по Москве).
+# Часы совпадают с расписанием в самих задачах; здесь они продублированы,
+# потому что решение принимается тут.
+РАСПИСАНИЕ = {
+    "calls_watch.yml":     (30, range(10, 22)),   # пропущенные звонки
+    "call_tasks.yml":      (10, range(10, 22)),   # напоминания перезвонить
+    "calls.yml":           (30, range(9, 23)),    # отчёт о звонках
+    "yandex_requests.yml": (20, range(0, 24)),    # заявки с карточки Яндекса
+    "plans.yml":           (30, range(8, 19)),    # планы и просрочки
+    "renewals.yml":        (60, range(10, 19)),   # отчёт по звонкам 13 и 17
+    "conversions.yml":     (60, range(0, 24)),    # конверсии отдела продаж
+    "appointments.yml":    (60, range(0, 24)),    # встречи из звонков
+    "site_guard.yml":     (120, range(0, 24)),    # охрана сайта
+    "cloud_guard.yml":    (180, range(0, 24)),    # сторож самих задач
+}
+
+_СЛОТЫ = {}                       # задача → номер отрезка, который уже отработал
+_СЛОТЫ_ЗАМОК = threading.Lock()
+
+
+def _слот(шаг, сейчас):
+    """Номер отрезка внутри суток.
+
+    Считаем от начала суток, а не «сколько прошло с прошлого раза»: тогда
+    повторный стук будильника в ту же минуту не запускает задачу дважды,
+    а перезапуск сервиса не сбивает сетку.
+    """
+    return (сейчас.hour * 60 + сейчас.minute) // шаг
+
+
+def _запустить(имена):
+    for имя in имена:
+        try:
+            r = requests.post(
+                f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{имя}/dispatches",
+                headers={"Authorization": f"Bearer {GH_TOKEN}",
+                         "Accept": "application/vnd.github+json"},
+                json={"ref": "main"}, timeout=40)
+            print(f"[расписание] {имя} → {r.status_code}", flush=True)
+        except Exception as exc:
+            print(f"[расписание] {имя} не запустилась: {exc}", flush=True)
+
+
+@app.route("/cron/<secret>", methods=["GET", "POST"])
+def cron_tick(secret):
+    if not CRON_SECRET or secret != CRON_SECRET:
+        return jsonify(ok=False), 404
+    if not GH_TOKEN:
+        return jsonify(ok=False, error="нет токена GitHub"), 500
+
+    сейчас = datetime.now(MSK)
+    пора = []
+    for имя, (шаг, часы) in РАСПИСАНИЕ.items():
+        if сейчас.hour not in часы:
+            continue
+        слот = _слот(шаг, сейчас)
+        with _СЛОТЫ_ЗАМОК:
+            if _СЛОТЫ.get(имя) == слот:
+                continue
+            _СЛОТЫ[имя] = слот
+        пора.append(имя)
+
+    # Запускаем в стороне от ответа: будильник не должен ждать, пока GitHub
+    # примет десяток запросов, иначе он посчитает вызов неудачным.
+    if пора:
+        threading.Thread(target=_запустить, args=(пора,), daemon=True).start()
+
+    return jsonify(ok=True, время=сейчас.strftime("%d.%m %H:%M"), запущено=пора)
+
+
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-08-26-v9-site-lead-form-no-test-spam"
+VERSION = "2026-09-02-v10-cron"
 
 
 @app.route("/health")
 @app.route("/")
 def health():
     return jsonify(ok=True, bot="sandow-lead-bot", leads=len(LAST_LEAD),
-                   version=VERSION)
+                   version=VERSION, расписание=len(РАСПИСАНИЕ),
+                   будильник=bool(CRON_SECRET and GH_TOKEN))
 
 
 if __name__ == "__main__":
