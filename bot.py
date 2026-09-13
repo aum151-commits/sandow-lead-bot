@@ -287,6 +287,37 @@ def _log_lead_event(user_id, event, who):
         print(f"[lead-log] {exc}", flush=True)
 
 
+def gh_read_json(path, default=None):
+    """Чтение произвольного JSON из хранилища. Нужен модулю распределения:
+    у него своя история, но незачем заводить второй способ ходить в GitHub."""
+    try:
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
+        if r.status_code != 200:
+            return default
+        return json.loads(base64.b64decode(r.json()["content"]).decode("utf-8"))
+    except Exception as exc:
+        print(f"[gh] чтение {path}: {exc}", flush=True)
+        return default
+
+
+def gh_write_json(path, data, message):
+    try:
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
+        sha = r.json().get("sha") if r.status_code == 200 else None
+        body = {"message": message,
+                "content": base64.b64encode(
+                    json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
+        if sha:
+            body["sha"] = sha
+        w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
+        if w.status_code not in (200, 201):
+            print(f"[gh] запись {path}: {w.status_code} {w.text[:120]}", flush=True)
+    except Exception as exc:
+        print(f"[gh] запись {path}: {exc}", flush=True)
+
+
 def save_subscriber(user, segment=None, phone=None, call_name=None):
     """Дописывает или обновляет запись о человеке в базе подписчиков.
 
@@ -1736,8 +1767,13 @@ def site_lead():
 # здесь, в переменных сервиса.
 
 CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
-GH_TOKEN = os.environ.get("GH_DISPATCH_TOKEN", "").strip()
-GH_REPO = os.environ.get("GH_REPO", "aum151-commits/sandow-lp").strip()
+# ВНИМАНИЕ: имена намеренно СВОИ, не GH_TOKEN/GH_REPO. Раньше здесь стояли
+# те же имена, что у хранилища подписчиков (строки 82-83), и переопределяли
+# их на весь модуль: база подписчиков и журнал лидов уходили в ПУБЛИЧНЫЙ
+# репозиторий sandow-lp вместо приватного sandow-automation. Утечка найдена
+# 13.09.2026. Не переименовывать обратно и не заводить здесь общих имён.
+CRON_GH_TOKEN = os.environ.get("GH_DISPATCH_TOKEN", "").strip()
+CRON_GH_REPO = os.environ.get("GH_REPO", "aum151-commits/sandow-lp").strip()
 
 # задача → (запускать раз в N минут, в какие часы по Москве).
 # Часы совпадают с расписанием в самих задачах; здесь они продублированы,
@@ -1773,8 +1809,8 @@ def _запустить(имена):
     for имя in имена:
         try:
             r = requests.post(
-                f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{имя}/dispatches",
-                headers={"Authorization": f"Bearer {GH_TOKEN}",
+                f"https://api.github.com/repos/{CRON_GH_REPO}/actions/workflows/{имя}/dispatches",
+                headers={"Authorization": f"Bearer {CRON_GH_TOKEN}",
                          "Accept": "application/vnd.github+json"},
                 json={"ref": "main"}, timeout=40)
             print(f"[расписание] {имя} → {r.status_code}", flush=True)
@@ -1786,7 +1822,7 @@ def _запустить(имена):
 def cron_tick(secret):
     if not CRON_SECRET or secret != CRON_SECRET:
         return jsonify(ok=False), 404
-    if not GH_TOKEN:
+    if not CRON_GH_TOKEN:
         return jsonify(ok=False, error="нет токена GitHub"), 500
 
     сейчас = datetime.now(MSK)
@@ -1819,7 +1855,8 @@ VERSION = "2026-09-02-v10-cron"
 def health():
     return jsonify(ok=True, bot="sandow-lead-bot", leads=len(LAST_LEAD),
                    version=VERSION, расписание=len(РАСПИСАНИЕ),
-                   будильник=bool(CRON_SECRET and GH_TOKEN))
+                   будильник=bool(CRON_SECRET and CRON_GH_TOKEN),
+                   хранилище=GH_REPO)
 
 
 if __name__ == "__main__":
