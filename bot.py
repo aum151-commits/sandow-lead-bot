@@ -1850,7 +1850,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-02-v10-cron"
+VERSION = "2026-09-23-v11-healthdiag"
 
 
 @app.route("/health")
@@ -1859,7 +1859,8 @@ def health():
     return jsonify(ok=True, bot="sandow-lead-bot", leads=len(LAST_LEAD),
                    version=VERSION, расписание=len(РАСПИСАНИЕ),
                    будильник=bool(CRON_SECRET and CRON_GH_TOKEN),
-                   хранилище=GH_REPO)
+                   хранилище=GH_REPO,
+                   токен_хранилища=bool(GH_TOKEN))
 
 
 if __name__ == "__main__":
