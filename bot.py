@@ -173,6 +173,23 @@ LANDINGS = {
              "занятие боксом бесплатное, и сверх этого дарим 72 часа в клубе."),
 }
 
+# Входы с печатных макетов ВНУТРИ клуба: t.me/sandowclub_bot?start=<код>.
+# Отличие от LANDINGS принципиальное: там человек с сайта, он ещё не наш —
+# ему положен подарок и вопрос «хотите в клуб?». Здесь код отсканирован в
+# раздевалке или у турникета, то есть человек уже член клуба. Спрашивать
+# его «Хочу в клуб / Уже занимаюсь» — глупо, поэтому ведём сразу в меню.
+#
+# Зачем коды вообще: в боте было 30 контактов, потому что Телеграм
+# запрещает боту писать первым. Пока человек сам не нажал «Старт», до него
+# не дойдёт ни напоминание об окончании абонемента, ни расписание. Макеты
+# в клубе — способ получить это первое касание, а разные коды показывают,
+# какой носитель сработал.
+КЛУБНЫЕ_ВХОДЫ = {
+    "razdevalka": "макет в раздевалке",
+    "turniket": "макет у турникета",
+    "klub": "макет в клубе",
+}
+
 
 FALLBACK_CHAT = os.environ.get("FALLBACK_CHAT_ID", "220285486").strip()
 
@@ -318,7 +335,7 @@ def gh_write_json(path, data, message):
         print(f"[gh] запись {path}: {exc}", flush=True)
 
 
-def save_subscriber(user, segment=None, phone=None, call_name=None):
+def save_subscriber(user, segment=None, phone=None, call_name=None, source=None):
     """Дописывает или обновляет запись о человеке в базе подписчиков.
 
     Работает в отдельном потоке: GitHub отвечает не мгновенно, а Telegram
@@ -326,11 +343,12 @@ def save_subscriber(user, segment=None, phone=None, call_name=None):
     """
     if not GH_TOKEN:
         return
-    threading.Thread(target=_save_subscriber, args=(dict(user), segment, phone, call_name),
+    threading.Thread(target=_save_subscriber,
+                     args=(dict(user), segment, phone, call_name, source),
                      daemon=True).start()
 
 
-def _save_subscriber(user, segment, phone, call_name=None):
+def _save_subscriber(user, segment, phone, call_name=None, source=None):
     try:
         url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
         r = requests.get(url, headers=_gh_headers(), timeout=30)
@@ -355,6 +373,13 @@ def _save_subscriber(user, segment, phone, call_name=None):
             rec["phone"] = phone
         if call_name:
             rec["call_name"] = call_name
+        if source:
+            # Первый источник не перезатираем: важно, что именно привело
+            # человека в бот, а не последняя ссылка, по которой он зашёл.
+            # Раньше метка жила только в оперативном STATE и умирала при
+            # перезапуске сервиса — посчитать носители было нечем.
+            rec.setdefault("source", source)
+            rec["source_last"] = source
         data[key] = rec
 
         body = {"message": f"tg-бот: подписчик {key} ({rec.get('segment', '?')})",
@@ -1541,13 +1566,36 @@ def on_message(msg):
         # deep-link с лендинга: «/start boks» → тема разговора с первого слова
         parts = text.split(maxsplit=1)
         theme = parts[1].strip().lower() if len(parts) > 1 else ""
+        # Белый список: payload deep-link у Telegram и так ограничен
+        # [A-Za-z0-9_-], но напечатанное руками «/start <b» ушло бы в
+        # заявку как есть и сломало разбор HTML — заявка не дошла бы
+        # ни в группу, ни в личку.
+        src = theme if re.fullmatch(r"[a-z0-9_-]{1,32}", theme or "") else None
+
+        # Код с печатного макета внутри клуба: человек уже член клуба,
+        # развилка «Хочу в клуб / Уже занимаюсь» ему не нужна — ведём
+        # сразу в меню. Источник пишем в базу, чтобы было видно, какой
+        # носитель сработал.
+        if src in КЛУБНЫЕ_ВХОДЫ:
+            with LOCK:
+                STATE.pop(chat_id, None)
+                STATE[chat_id] = {"src": src}
+            save_subscriber(user, segment="member", source=КЛУБНЫЕ_ВХОДЫ[src])
+            имя = user.get("first_name") or ""
+            api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+                text=(f"Здравствуйте{', ' + имя if имя else ''}! Это Телеграм "
+                      "клуба «Сандов Фитнес».\n\n"
+                      "Теперь расписание и связь с менеджером — здесь, "
+                      "звонить не нужно."))
+            return step_member_menu(chat_id, greet=False)
+
         if theme not in LANDINGS:
             theme = None
         with LOCK:
             STATE.pop(chat_id, None)
-            if theme:
-                STATE[chat_id] = {"src": theme}
-        save_subscriber(user)
+            if src:
+                STATE[chat_id] = {"src": src}
+        save_subscriber(user, source=(LANDINGS[theme][0] if theme in LANDINGS else src))
         return step_gate(chat_id, user.get("first_name"), theme=theme)
 
     if text.startswith("/help"):
