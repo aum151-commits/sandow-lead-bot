@@ -1798,7 +1798,17 @@ def site_lead():
     if request.method == "OPTIONS":
         return _cors(app.make_response(("", 204)), origin)
 
-    data = request.get_json(silent=True) or request.form or {}
+    сырые = request.get_json(silent=True) or request.form or {}
+
+    # Имена полей приводим к нижнему регистру. Наши формы шлют "phone" и
+    # "name", а вебхук Тильды — "Phone", "Name", "Comment" с большой
+    # буквы. Пока этого не было, заявка с формы Тильзы упиралась в
+    # ответ 400 «phone»: приёмник просто не находил телефон.
+    # Найдено 26.09.2026 при разборе «заявки с сайта не доходят до чата
+    # менеджеров» (требование Ольги: заявки должны падать И в 1С, И в
+    # группу заявок — только так их можно контролировать).
+    data = {str(k).lower(): v for k, v in dict(сырые).items()}
+
     # ловушка для роботов: поле спрятано от людей, заполняется только ботами
     if (data.get("company") or "").strip():
         return _cors(jsonify(ok=True), origin)
@@ -1817,7 +1827,9 @@ def site_lead():
     if now - last < 600:
         return _cors(jsonify(ok=True, repeat=True), origin)
 
-    page = (data.get("page") or "").strip()[:120]
+    # «page» — наши формы, «formname»/«referer» — вебхук Тильды.
+    page = (data.get("page") or data.get("formname")
+            or data.get("referer") or "").strip()[:120]
     name = (data.get("name") or "").strip()[:60]
     when = datetime.now(MSK).strftime("%d.%m в %H:%M")
 
@@ -1836,7 +1848,9 @@ def site_lead():
         f"<b>Телефон:</b> <code>{phone}</code>\n\n"
         f"<b>Подарок:</b> {GIFT}\n"
         f"<b>Страница:</b> {page or 'не указана'}\n\n"
-        f"Форма на статье · {when}"
+        # Раньше здесь всегда стояло «Форма на статье» — для заявки с
+        # главной страницы это неправда и сбивает менеджера с толку.
+        f"{'Форма на сайте' if data.get('formid') or data.get('formname') else 'Форма на статье'} · {when}"
     )
     user = {"id": f"site-{digits[-10:]}", "first_name": name or "Гость с сайта"}
     text += send_to_1c(user, phone, "keep", "any", f"статья: {page}")
@@ -1938,7 +1952,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-26-v16-neytralnyy-podarok"
+VERSION = "2026-09-26-v17-tilda-v-gruppu"
 
 
 @app.route("/health")
