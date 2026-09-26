@@ -814,7 +814,7 @@ def _segment(chat_id):
 
 # ------------------------------------------------------------------- заявка
 
-def send_to_1c(user, phone, goal, direction, source=""):
+def send_to_1c(user, phone, goal, direction, source="", метки=None):
     """Заводит заявку в 1С:Фитнес клуб. Возвращает приписку к сообщению в группе.
 
     Данные уходят формой — тем же способом, каким шлёт Тильда. JSON приёмник
@@ -841,6 +841,13 @@ def send_to_1c(user, phone, goal, direction, source=""):
         "formid": "sandow_lead_bot",
         "tranid": f"tg-{user.get('id')}-{int(time.time())}",
     }
+    # Заявка могла прийти не из бота, а с формы сайта — тогда у неё свои
+    # метки источника (yandex/maps и прочее). Подставлять им «telegram /
+    # bot» нельзя: в 1С и в отчётах канал станет враньём, и по ним потом
+    # считают, откуда приходят люди. Поэтому вызывающий передаёт метки,
+    # и они перекрывают умолчания.
+    if метки:
+        data.update({k: v for k, v in метки.items() if v})
     try:
         r = requests.post(ONEC_WEBHOOK, data=data, timeout=25)
         if r.status_code == 200:
@@ -1853,7 +1860,23 @@ def site_lead():
         f"{'Форма на сайте' if data.get('formid') or data.get('formname') else 'Форма на статье'} · {when}"
     )
     user = {"id": f"site-{digits[-10:]}", "first_name": name or "Гость с сайта"}
-    text += send_to_1c(user, phone, "keep", "any", f"статья: {page}")
+    # Метки источника берём те, что пришли с формой: у заявок с сайта
+    # это yandex/maps и прочее — они должны доехать до 1С как есть.
+    метки = {k: data.get(k) for k in
+             ("utm_source", "utm_medium", "utm_campaign", "utm_content",
+              "utm_term", "formname", "formid", "referer")}
+    метки["tranid"] = (data.get("tranid")
+                       or f"site-{digits[-10:]}-{int(time.time())}")
+    if not метки.get("utm_source"):
+        метки["utm_source"] = "site"
+        метки["utm_medium"] = "form"
+    # Комментарий в карточке 1С тоже не должен врать про Telegram-бота:
+    # менеджер по нему понимает, откуда человек и о чём с ним говорить.
+    метки["formid"] = метки.get("formid") or "sandow_site_form"
+    метки["Comment"] = ("Заявка с сайта. "
+                        + (f"Страница: {page}. " if page else "")
+                        + f"Подарок: {GIFT}.")
+    text += send_to_1c(user, phone, "keep", "any", f"страница: {page}", метки)
     send_to_orders(text=text, parse_mode="HTML")
     return _cors(jsonify(ok=True), origin)
 
@@ -1952,7 +1975,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-26-v17-tilda-v-gruppu"
+VERSION = "2026-09-26-v18-metki-istochnika"
 
 
 @app.route("/health")
