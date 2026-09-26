@@ -259,6 +259,31 @@ def _gh_headers():
 
 LEADS_GH_PATH = "data/lead_response_log.json"
 
+# Счётчик принятых заявок по дням. Нужен для сквозной сверки: сторож
+# сравнивает, сколько заявок лежит в Тильде за вчера и сколько из них
+# реально доехало до нас. Расхождение «в Тильде есть, у нас ноль» —
+# единственный признак, который заметил бы блокировку приёмника
+# 15.09.2026, когда все прочие проверки показывали «чисто» и 16 человек
+# остались без звонка.
+СЧЁТЧИК_ЗАЯВОК = "data/site_leads_by_day.json"
+
+
+def учесть_заявку() -> None:
+    """Отмечает в общем журнале, что заявка с сайта до нас доехала."""
+    def _работа():
+        try:
+            день = datetime.now(MSK).strftime("%Y-%m-%d")
+            данные = gh_read_json(СЧЁТЧИК_ЗАЯВОК, default={}) or {}
+            данные[день] = int(данные.get(день, 0)) + 1
+            # держим только последний месяц, файл не должен расти вечно
+            за_месяц = dict(sorted(данные.items())[-31:])
+            gh_write_json(СЧЁТЧИК_ЗАЯВОК, за_месяц,
+                          f"заявка с сайта {день}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[счётчик] не записан: {str(exc)[:120]}", flush=True)
+
+    threading.Thread(target=_работа, daemon=True).start()
+
 
 def log_lead_event(user_id, event, who=None):
     """Пишет момент создания заявки и момент «Беру в работу» — источник для
@@ -1878,6 +1903,7 @@ def site_lead():
                         + f"Подарок: {GIFT}.")
     text += send_to_1c(user, phone, "keep", "any", f"страница: {page}", метки)
     send_to_orders(text=text, parse_mode="HTML")
+    учесть_заявку()
     return _cors(jsonify(ok=True), origin)
 
 
@@ -1975,7 +2001,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-26-v18-metki-istochnika"
+VERSION = "2026-09-26-v19-schetchik-zayavok"
 
 
 @app.route("/health")
