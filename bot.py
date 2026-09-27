@@ -285,17 +285,21 @@ def учесть_заявку() -> None:
     threading.Thread(target=_работа, daemon=True).start()
 
 
-def log_lead_event(user_id, event, who=None):
+def log_lead_event(user_id, event, who=None, phone=None):
     """Пишет момент создания заявки и момент «Беру в работу» — источник для
     метрики SLA (норматив 3 минуты, по разбору с коучем 18.08.2026). Раньше
     такого лога не было нигде: ни у Тильды, ни у бота, поэтому текущее время
-    ответа не с чем было сверить."""
+    ответа не с чем было сверить.
+
+    Телефон в записи нужен для сверки с журналом звонков АТС: «Беру в
+    работу» — это клик в чате, а не факт звонка, поэтому настоящую скорость
+    первого контакта считает отдельный отчёт по совпадению номера."""
     if not GH_TOKEN:
         return
-    threading.Thread(target=_log_lead_event, args=(str(user_id), event, who), daemon=True).start()
+    threading.Thread(target=_log_lead_event, args=(str(user_id), event, who, phone), daemon=True).start()
 
 
-def _log_lead_event(user_id, event, who):
+def _log_lead_event(user_id, event, who, phone=None):
     try:
         url = f"https://api.github.com/repos/{GH_REPO}/contents/{LEADS_GH_PATH}"
         r = requests.get(url, headers=_gh_headers(), timeout=30)
@@ -308,6 +312,8 @@ def _log_lead_event(user_id, event, who):
 
         rec = data.get(user_id, {})
         now = datetime.now(MSK)
+        if phone:
+            rec["phone"] = phone
         if event == "lead_created":
             rec["lead_created_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
         elif event == "taken" and not rec.get("taken_at"):
@@ -903,7 +909,7 @@ def send_lead(user, phone, goal, direction, source=""):
     text += send_to_1c(user, phone, goal, direction, source)
     r = send_to_orders(text=text, parse_mode="HTML",
                         reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
-    log_lead_event(user.get("id"), "lead_created")
+    log_lead_event(user.get("id"), "lead_created", phone=phone)
     return (r.get("result") or {}).get("message_id")
 
 
@@ -1904,6 +1910,10 @@ def site_lead():
     text += send_to_1c(user, phone, "keep", "any", f"страница: {page}", метки)
     send_to_orders(text=text, parse_mode="HTML")
     учесть_заявку()
+    # Заявка с сайта — в тот же журнал SLA, что и заявки бота. До 27.09.2026
+    # журнал видел только Telegram-заявки (которых почти нет), поэтому
+    # скорость первого контакта было не по чему считать.
+    log_lead_event(user["id"], "lead_created", phone=phone)
     return _cors(jsonify(ok=True), origin)
 
 
@@ -2001,7 +2011,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-26-v19-schetchik-zayavok"
+VERSION = "2026-09-27-v20-sla-site-leads"
 
 
 @app.route("/health")
