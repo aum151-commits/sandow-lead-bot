@@ -845,14 +845,19 @@ def finalize_booking(chat_id, message_id, user, st):
 def finalize_member_training(chat_id, message_id, user, st):
     """Раздел 4 «Записаться на тренировку» (член клуба) — правка Ольги 28.09:
     раньше сразу уходило координатору без вопроса о времени, теперь так же,
-    как у новых клиентов, сначала день и время."""
+    как у новых клиентов, сначала день и время. Вторая правка (тот же день):
+    реплай-мост убран — раз время уже известно, координатор подтверждает
+    одной кнопкой (confirmvisit/coordinator_confirm), тем же способом, что
+    и у новых клиентов; отдельно отвечать реплаем незачем."""
     already = st.get("member_training_already", False)
     time_pref = st.get("time_pref", "не указано")
-    note = (f"Хорошо — {time_pref}, согласуем с вашим экспертом, напишу вам здесь."
+    who_client = user.get("first_name") or ""
+    note = (f"Принято{', ' + who_client if who_client else ''}! {time_pref} — "
+            "согласую с вашим экспертом и подтвержу здесь же."
             if already else
-            f"Хорошая новость: первая тренировка с фитнес-экспертом — в "
-            f"подарок, {time_pref}. Подберу эксперта под вашу задачу, "
-            "подтвержу здесь же.")
+            f"Хорошая новость{', ' + who_client if who_client else ''}: первая "
+            f"тренировка с фитнес-экспертом — в подарок, {time_pref}. Подберу "
+            "эксперта под вашу задачу и подтвержу здесь же.")
     if message_id:
         api("editMessageText", chat_id=chat_id, message_id=message_id, text=note)
     else:
@@ -860,14 +865,21 @@ def finalize_member_training(chat_id, message_id, user, st):
 
     label = "уже занимается с экспертом" if already else "НИКОГДА не занимался — вводная ПТ в подарок"
     card = (f"🏋️ <b>ЗАПИСЬ НА ТРЕНИРОВКУ (член клуба)</b>\n{member_card_line(user)}\n"
-            f"Статус: {label}.\n<b>Желаемое время:</b> {time_pref}.\n"
-            f"Согласуйте с клиентом реплаем — ответ уйдёт в бот.\n#id{chat_id}")
-    send_to_orders(parse_mode="HTML", text=f"{COORDINATOR_TG}\n{card}")
+            f"Статус: {label}.\n<b>Желаемое время:</b> {time_pref}.")
+    r = send_to_orders(parse_mode="HTML",
+        text=f"{card}\n\n{COORDINATOR_TG} — подтвердите время клиенту одним нажатием:",
+        reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
+    booking_mid = (r.get("result") or {}).get("message_id")
     coord_id = coordinator_chat_id()
     if coord_id:
-        api("sendMessage", chat_id=coord_id, parse_mode="HTML", text=card)
+        api("sendMessage", chat_id=coord_id, parse_mode="HTML",
+            text=f"{card}\n\nПодтвердите время клиенту одним нажатием:",
+            reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
     with LOCK:
-        STATE[chat_id] = {"segment": "member", "bridge": True}
+        STATE[chat_id] = {
+            "segment": "member", "fmt": "training", "time_pref": time_pref,
+            "booking_mid": booking_mid, "client_name": who_client,
+        }
 
 
 def slot_chosen(chat_id, message_id, user, fmt, period, hhmm):
@@ -898,9 +910,15 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who):
         fmt = st.get("fmt", "training")
         time_pref = st.get("time_pref", "")
         name = st.get("client_name", "")
+        is_member = st.get("segment") == "member"
     maps_url = "https://yandex.ru/maps/?text=" + _url_quote(f"Москва, {CLUB}")
     hi = f"Подтверждаю, {name}" if name else "Подтверждаю"
-    if fmt == "training":
+    if is_member:
+        # Действующий член клуба — у неё уже есть браслет и доступ, паспорт
+        # и адрес не нужны (это только для гостя, правка 28.09).
+        text = (f"{hi}: {time_pref}. Фитнес-эксперт уже знает о встрече, "
+                "ждём вас! До скорой связи!")
+    elif fmt == "training":
         text = (f"{hi}: {time_pref}. Возьмите спортивную форму, кроссовки и "
                 f"паспорт — он нужен для оформления гостевого визита.\n"
                 f"Адрес: Москва, {CLUB}. Маршрут: {maps_url}\n"
@@ -2532,7 +2550,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v30-weekday-picker"
+VERSION = "2026-09-28-v31-member-confirm-button"
 
 
 @app.route("/health")
