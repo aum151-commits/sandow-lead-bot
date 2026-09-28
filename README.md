@@ -4,13 +4,36 @@
 
 | Что | Где |
 |---|---|
-| Адрес сервиса | https://sandow-lead-bot.onrender.com |
-| Проверка живости | https://sandow-lead-bot.onrender.com/health |
-| Работает на боте | @SandowMarketig_bot — на него уже ведёт сайт |
+| Адрес сервиса | https://sandow-lead-bot-standalone.onrender.com (переезд 28.09.2026 — см. ниже) |
+| Проверка живости | https://sandow-lead-bot-standalone.onrender.com/health |
+| Работает на боте | @sandowclub_bot (прежний @SandowMarketig_bot — до сентября 2026) |
 | Прежняя ссылка на сайте | @sandowfitness_ru_bot — чужой бот, заменён 11.08.2026 |
 | Заявки падают в | группу «Sandow заявки» (`-1001793724014`) |
-| Код | `bot.py`, деплой из github.com/aum151-commits/sandow-lead-bot |
-| Render | сервис `srv-d9t3dhdbedkc73eiqpq0`, тариф free |
+| Код | `bot.py`, исходники — github.com/aum151-commits/sandow-lead-bot |
+| Render | сервис `srv-dat63l942hec73fldsd0`, аккаунт **отдельный** (email `sandow.reports+leadbot@yandex.ru`), тариф free |
+| API-ключ этого аккаунта | `RENDER_STANDALONE_API_KEY` в `yandex-business-automation/.env` |
+
+**28.09.2026 — бот переехал на СВОЙ, отдельный аккаунт Render.** Раньше
+делил один аккаунт (`RENDER_NEW_API_KEY`, сервис `sandow-lead-bot-v2`,
+`srv-dame10ad0e5s73f35qi0`) с `wiki`/`trener-hub`/`voice-trainer` — общий
+лимит 750 часов/мес на все четыре сразу не давал держать бота бодрым
+круглосуточно без риска положить остальные сервисы (ровно это уронило
+первый аккаунт 16.09.2026). Теперь у бота свой лимит, которым не с кем
+делиться. Старый сервис `sandow-lead-bot-v2` НЕ удалён — оставлен
+нетронутым на случай отката, но вебхук и весь трафик уже идут на новый.
+
+**Бот сам не даёт себе уснуть** — `_self_ping()` в `bot.py` (с версии v26)
+раз в 10 минут стучится на собственный `RENDER_EXTERNAL_URL`, тем же
+приёмом, что уже год работает у `sandow-cron` (память
+`cloud-scheduler-own-heartbeat`). Не зависит ни от ноутбука, ни от
+расписания GitHub Actions (оно, измерено, опаздывает на часы). Локальную
+задачу планировщика «Сандов - бот лидов не спит» из-за этого можно
+выключить — сама себя больше не подстраховывает необходимость.
+
+Сторож `lead_bot_guard.yml` и будильник `keepalive.yml` (оба в
+`aum151-commits/sandow-lp`) обновлены на новый адрес — не забыть поправить
+и их при следующем переезде, иначе история 18.09.2026 (сторож откатывал
+вебхук на устаревший адрес) повторится.
 
 ## Диалог
 
@@ -48,8 +71,25 @@
 
 ## Выкатить изменения
 
-Правки в `bot.py` → скопировать файл в клон репозитория → `git push`. Render
-пересоберёт сам за пару минут (autoDeploy включён).
+Проверено 28.09.2026: `autoDeploy` НЕ работает так, как раньше здесь было
+написано — сервис деплоится из Docker-образа `ghcr.io/aum151-commits/
+sandow-lead-bot:latest`, а не напрямую из исходников. Просто `git push`
+ничего не меняет на живом сервисе, пока образ не пересобран. Порядок:
+
+1. Правки в `bot.py` → закоммитить и `git push` в
+   github.com/aum151-commits/sandow-lead-bot (ветка `main`).
+2. Пересобрать образ: `POST` без тела на
+   `https://api.github.com/repos/aum151-commits/sandow-lp/actions/workflows/build_images.yml/dispatches`
+   с `{"ref":"main"}`, токен — `GITHUB_TOKEN_WORKFLOW` из `.env`
+   (`yandex-business-automation/.env`). Занимает около минуты, проверить
+   через `.../actions/workflows/build_images.yml/runs?per_page=1`.
+3. Задеплоить новый образ: `POST` на
+   `https://api.render.com/v1/services/srv-dame10ad0e5s73f35qi0/deploys`
+   с `{"clearCache":"do_not_clear"}`, токен — `RENDER_NEW_API_KEY`
+   (НЕ `RENDER_API_KEY` — тот ключ для старого аккаунта Render, отдаёт
+   «not found» на этот ID сервиса).
+4. Проверить `/health`: поле `version` должно смениться (бампать `VERSION`
+   в `bot.py` при каждой правке — иначе не отличить доехало или нет).
 
 ## Про бесплатный тариф
 
