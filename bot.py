@@ -718,19 +718,39 @@ def ask_health(chat_id, name):
               "суставы, давление? Если нет — просто напишите «нет»."))
 
 
-def step_time(chat_id, fmt):
-    api("sendMessage", chat_id=chat_id, text="Когда вам удобнее?",
-        reply_markup=kb([
-            [("Будни", f"tp:wd:{fmt}")],
-            [("Выходные", f"tp:we:{fmt}")],
-        ]))
+# Правка Ольги 28.09 (живая проверка): «будни/выходные» слишком расплывчато —
+# нужен конкретный день недели, не диапазон. Порядок словаря = порядок кнопок.
+WEEKDAYS = {
+    "mon": "понедельник", "tue": "вторник", "wed": "среда",
+    "thu": "четверг", "fri": "пятница", "sat": "суббота", "sun": "воскресенье",
+}
+# Винительный падеж с предлогом — «в среду», «во вторник» — простое
+# правило «добавить у» ломается на «среда»/«суббота» (не «средуу»),
+# поэтому формы просто выписаны, без грамматических хитростей.
+WEEKDAYS_ACC = {
+    "mon": "в понедельник", "tue": "во вторник", "wed": "в среду",
+    "thu": "в четверг", "fri": "в пятницу", "sat": "в субботу", "sun": "в воскресенье",
+}
+
+
+def step_time(chat_id, fmt, message_id=None):
+    text = "Когда вам удобнее? Выберите день:"
+    markup = kb([
+        [("Пн", f"tp:mon:{fmt}"), ("Вт", f"tp:tue:{fmt}"), ("Ср", f"tp:wed:{fmt}"),
+         ("Чт", f"tp:thu:{fmt}")],
+        [("Пт", f"tp:fri:{fmt}"), ("Сб", f"tp:sat:{fmt}"), ("Вс", f"tp:sun:{fmt}")],
+    ])
+    if message_id:
+        api("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
+    else:
+        api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
 
 
 def step_slots(chat_id, message_id, period, fmt):
     slots = SLOTS_TRAINING if fmt == "training" else SLOTS_TOUR
     rows = [[(t, f"sl:{fmt}:{period}:{t}")] for t in slots]
     rows.append([("Своё время", f"sl:{fmt}:{period}:own")])
-    label = "в будни" if period == "wd" else "в выходные"
+    label = WEEKDAYS_ACC.get(period, period)
     api("editMessageText", chat_id=chat_id, message_id=message_id,
         text=f"Выберите время {label}:", reply_markup=kb(rows))
 
@@ -822,6 +842,34 @@ def finalize_booking(chat_id, message_id, user, st):
     push_1c_followup(phone, extra)
 
 
+def finalize_member_training(chat_id, message_id, user, st):
+    """Раздел 4 «Записаться на тренировку» (член клуба) — правка Ольги 28.09:
+    раньше сразу уходило координатору без вопроса о времени, теперь так же,
+    как у новых клиентов, сначала день и время."""
+    already = st.get("member_training_already", False)
+    time_pref = st.get("time_pref", "не указано")
+    note = (f"Хорошо — {time_pref}, согласуем с вашим экспертом, напишу вам здесь."
+            if already else
+            f"Хорошая новость: первая тренировка с фитнес-экспертом — в "
+            f"подарок, {time_pref}. Подберу эксперта под вашу задачу, "
+            "подтвержу здесь же.")
+    if message_id:
+        api("editMessageText", chat_id=chat_id, message_id=message_id, text=note)
+    else:
+        api("sendMessage", chat_id=chat_id, text=note)
+
+    label = "уже занимается с экспертом" if already else "НИКОГДА не занимался — вводная ПТ в подарок"
+    card = (f"🏋️ <b>ЗАПИСЬ НА ТРЕНИРОВКУ (член клуба)</b>\n{member_card_line(user)}\n"
+            f"Статус: {label}.\n<b>Желаемое время:</b> {time_pref}.\n"
+            f"Согласуйте с клиентом реплаем — ответ уйдёт в бот.\n#id{chat_id}")
+    send_to_orders(parse_mode="HTML", text=f"{COORDINATOR_TG}\n{card}")
+    coord_id = coordinator_chat_id()
+    if coord_id:
+        api("sendMessage", chat_id=coord_id, parse_mode="HTML", text=card)
+    with LOCK:
+        STATE[chat_id] = {"segment": "member", "bridge": True}
+
+
 def slot_chosen(chat_id, message_id, user, fmt, period, hhmm):
     if hhmm == "own":
         with LOCK:
@@ -829,11 +877,14 @@ def slot_chosen(chat_id, message_id, user, fmt, period, hhmm):
         return api("editMessageText", chat_id=chat_id, message_id=message_id,
                    text="Напишите, пожалуйста, день и время словами — это нужно, "
                         "чтобы забронировать для вас удобное окно.")
-    day_label = "ближайшие будни" if period == "wd" else "ближайшие выходные"
+    day_label = WEEKDAYS.get(period, period)
     with LOCK:
         st = STATE.setdefault(chat_id, {})
         st["time_pref"] = f"{day_label}, {hhmm}"
+        member_flow = "member_training_already" in st
         snapshot = dict(st)
+    if member_flow:
+        return finalize_member_training(chat_id, message_id, user, snapshot)
     finalize_booking(chat_id, message_id, user, snapshot)
 
 
@@ -1923,26 +1974,16 @@ def on_button(cq):
                    reply_markup=kb([[("Да", "bt:yes")], [("Нет", "bt:no")]]))
 
     if data.startswith("bt:"):
-        already = data.split(":", 1)[1] == "yes"
-        note = ("Хорошо — согласуем время с вашим экспертом, напишу вам здесь."
-                if already else
-                "Тогда у меня хорошая новость: первая тренировка с фитнес-"
-                "экспертом — в подарок. Подберу эксперта под вашу задачу и "
-                "предложу время здесь же.")
         # РЕШЕНИЕ ОЛЬГИ 27.09: члену клуба, который никогда не занимался с
         # тренером В НАШЕМ клубе, вводная тренировка дарится обязательно;
         # тому, кто уже занимается, — не дарится (фильтр вопросом выше).
-        label = "уже занимается с экспертом" if already else "НИКОГДА не занимался — вводная ПТ в подарок"
-        card = (f"🏋️ <b>ЗАПИСЬ НА ТРЕНИРОВКУ (член клуба)</b>\n{member_card_line(user)}\n"
-                f"Статус: {label}.\nСогласуйте время с клиентом реплаем — "
-                f"ответ уйдёт в бот.\n#id{chat_id}")
-        send_to_orders(parse_mode="HTML", text=f"{COORDINATOR_TG}\n{card}")
-        coord_id = coordinator_chat_id()
-        if coord_id:
-            api("sendMessage", chat_id=coord_id, parse_mode="HTML", text=card)
+        # Правка 28.09 (живая проверка): раньше уходило координатору сразу,
+        # без вопроса о времени — теперь как у новых клиентов, сначала день
+        # и время, и только потом карточка координатору.
+        already = data.split(":", 1)[1] == "yes"
         with LOCK:
-            STATE.setdefault(chat_id, {})["bridge"] = True
-        return api("editMessageText", chat_id=chat_id, message_id=mid, text=note)
+            STATE.setdefault(chat_id, {})["member_training_already"] = already
+        return step_time(chat_id, "training", message_id=mid)
 
     if data == "go":
         return step_dir(chat_id, mid, "")
@@ -2165,7 +2206,10 @@ def on_message(msg):
             st = STATE.setdefault(chat_id, {})
             st.pop("await_own_time", None)
             st["time_pref"] = text.strip()
+            member_flow = "member_training_already" in st
             snapshot = dict(st)
+        if member_flow:
+            return finalize_member_training(chat_id, None, user, snapshot)
         return finalize_booking(chat_id, None, user, snapshot)
 
     # после заявки спросили, как обращаться — ловим ответ. Необязательный шаг:
@@ -2488,7 +2532,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v29-coordinator-dm-and-quiet-hours"
+VERSION = "2026-09-28-v30-weekday-picker"
 
 
 @app.route("/health")
