@@ -910,6 +910,8 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who):
         fmt = st.get("fmt", "training")
         time_pref = st.get("time_pref", "")
         name = st.get("client_name", "")
+        phone = st.get("phone", "")
+        direction = st.get("dir", "any")
         is_member = st.get("segment") == "member"
     maps_url = "https://yandex.ru/maps/?text=" + _url_quote(f"Москва, {CLUB}")
     hi = f"Подтверждаю, {name}" if name else "Подтверждаю"
@@ -931,6 +933,23 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who):
     who_name = who.get("first_name", "менеджер")
     api("editMessageReplyMarkup", chat_id=group_chat_id, message_id=message_id,
         reply_markup=kb([[(f"✅ Подтверждено: {who_name}", "noop")]]))
+
+    # Правка Ольги 28.09: после подтверждения — явная задача дежурному
+    # менеджеру в чат заявок (не в 1С — там задачи ставить нельзя, API
+    # закрыт, проверено ранее; заявка туда и так уже падает через
+    # send_to_1c/push_1c_followup, менеджер сам заводит себе задачу по
+    # этому сообщению, как и раньше).
+    if not is_member:
+        active = active_manager_name()
+        kind = "Тренировка с тренером" if fmt == "training" else "Экскурсия"
+        who_line = f"Менеджер {active}" if active else "Дежурный менеджер"
+        send_to_orders(parse_mode="HTML",
+            text=(f"📋 <b>ЗАДАЧА: {kind.upper()} НАЗНАЧЕНА</b>\n"
+                  f"{who_line} — {time_pref}.\n"
+                  f"<b>Клиент:</b> {name or 'без имени'}"
+                  + (f" · <code>{phone}</code>" if phone else "") + "\n"
+                  f"<b>Направление:</b> {DIRS.get(direction, DIRS['any'])[0]}\n"
+                  "Заявка уже в 1С — поставьте себе задачу на встречу."))
 
 
 def step_done(chat_id, name):
@@ -2550,7 +2569,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v31-member-confirm-button"
+VERSION = "2026-09-28-v32-manager-task-on-confirm"
 
 
 @app.route("/health")
