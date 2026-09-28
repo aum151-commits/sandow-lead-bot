@@ -409,6 +409,32 @@ def gh_write_json(path, data, message):
         print(f"[gh] запись {path}: {exc}", flush=True)
 
 
+_COORD_CHAT = {"id": None, "ts": 0}
+
+
+def coordinator_chat_id():
+    """chat_id координатора зала по её нику (COORDINATOR_TG), если она хоть
+    раз нажимала /start у бота — тогда она есть в базе подписчиков
+    (data/tg_subscribers.json, GH_PATH) с полем username. Без этого бот
+    физически не может написать ей лично — Telegram запрещает боту первым
+    писать тому, кто не начинал диалог. Пока она не жала /start —
+    возвращаем None, упоминание остаётся только в группе (как раньше).
+    Правка Ольги 28.09: живая проверка показала, что одного упоминания
+    в группе мало — надёжнее личное сообщение."""
+    if time.time() - _COORD_CHAT["ts"] < 300:
+        return _COORD_CHAT["id"]
+    uname = COORDINATOR_TG.lstrip("@").lower()
+    data = gh_read_json(GH_PATH, default={}) or {}
+    found = None
+    for chat_id, rec in data.items():
+        if (rec.get("username") or "").lower() == uname:
+            found = int(chat_id)
+            break
+    _COORD_CHAT["id"] = found
+    _COORD_CHAT["ts"] = time.time()
+    return found
+
+
 _ACTIVE_MGR = {"name": None, "ts": 0}
 
 
@@ -738,14 +764,19 @@ def finalize_booking(chat_id, message_id, user, st):
     name = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
     who_client = user.get("first_name") or ""
 
+    # Правка Ольги 28.09 (живая проверка бота): ночью «подтвержу в течение
+    # часа» — невыполнимое обещание, координатор и менеджеры не работают
+    # 24/7. Те же тихие часы, что уже действуют для уведомлений (QUIET_FROM/
+    # QUIET_TO, 22:00–10:00).
+    when = "в течение часа" if not is_quiet() else "в ближайшие рабочие часы"
     if fmt == "training":
         client_text = (
             f"Принято{', ' + who_client if who_client else ''}! Предварительно — {time_pref}. "
-            "Сверю время с расписанием фитнес-эксперта и подтвержу здесь же в "
-            "течение часа. Если окно окажется занято — предложу ближайшее соседнее.")
+            f"Сверю время с расписанием фитнес-эксперта и подтвержу здесь же {when}. "
+            "Если окно окажется занято — предложу ближайшее соседнее. До скорой связи!")
     else:
         client_text = (f"Готово{', ' + who_client if who_client else ''}! "
-                        f"Ждём вас — {time_pref}. Подтвержу здесь же в течение часа.")
+                        f"Ждём вас — {time_pref}. Подтвержу здесь же {when}. До скорой связи!")
     if message_id:
         api("editMessageText", chat_id=chat_id, message_id=message_id, text=client_text)
     else:
@@ -773,6 +804,12 @@ def finalize_booking(chat_id, message_id, user, st):
     r = send_to_orders(parse_mode="HTML", text="\n".join(lines),
                         reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
     booking_mid = (r.get("result") or {}).get("message_id")
+    if fmt == "training":
+        coord_id = coordinator_chat_id()
+        if coord_id:
+            api("sendMessage", chat_id=coord_id, parse_mode="HTML",
+                text="\n".join(lines[:-1]) + "\n\nПодтвердите время клиенту одним нажатием:",
+                reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
 
     with LOCK:
         STATE[chat_id] = {
@@ -1896,10 +1933,13 @@ def on_button(cq):
         # тренером В НАШЕМ клубе, вводная тренировка дарится обязательно;
         # тому, кто уже занимается, — не дарится (фильтр вопросом выше).
         label = "уже занимается с экспертом" if already else "НИКОГДА не занимался — вводная ПТ в подарок"
-        send_to_orders(parse_mode="HTML",
-            text=f"🏋️ <b>ЗАПИСЬ НА ТРЕНИРОВКУ (член клуба)</b>\n{member_card_line(user)}\n"
-                 f"Статус: {label}.\n{COORDINATOR_TG} — согласуйте время с клиентом "
-                 f"реплаем, ответ уйдёт в бот.\n#id{chat_id}")
+        card = (f"🏋️ <b>ЗАПИСЬ НА ТРЕНИРОВКУ (член клуба)</b>\n{member_card_line(user)}\n"
+                f"Статус: {label}.\nСогласуйте время с клиентом реплаем — "
+                f"ответ уйдёт в бот.\n#id{chat_id}")
+        send_to_orders(parse_mode="HTML", text=f"{COORDINATOR_TG}\n{card}")
+        coord_id = coordinator_chat_id()
+        if coord_id:
+            api("sendMessage", chat_id=coord_id, parse_mode="HTML", text=card)
         with LOCK:
             STATE.setdefault(chat_id, {})["bridge"] = True
         return api("editMessageText", chat_id=chat_id, message_id=mid, text=note)
@@ -1980,8 +2020,13 @@ def on_message(msg):
 
     # Ответ менеджера реплаем на карточку с меткой #id. Обычно карточки живут
     # в рабочей группе, но при тестовом режиме ORDERS_CHAT — личный чат, и
-    # реплаи должны работать и там.
-    if str(chat_id) in (str(ORDERS_CHAT), str(BRIDGE_CHAT)) and msg.get("reply_to_message"):
+    # реплаи должны работать и там. Координатору (правка 28.09) карточка
+    # дублируется личным сообщением — её реплай тоже должен долетать.
+    reply_allowed_chats = {str(ORDERS_CHAT), str(BRIDGE_CHAT)}
+    coord_id = coordinator_chat_id()
+    if coord_id:
+        reply_allowed_chats.add(str(coord_id))
+    if str(chat_id) in reply_allowed_chats and msg.get("reply_to_message"):
         if bridge_from_group(msg):
             return
 
@@ -2443,7 +2488,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v28-active-manager"
+VERSION = "2026-09-28-v29-coordinator-dm-and-quiet-hours"
 
 
 @app.route("/health")
