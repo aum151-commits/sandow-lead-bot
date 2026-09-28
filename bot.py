@@ -27,6 +27,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote as _url_quote
 
 import requests
 from flask import Flask, request, jsonify
@@ -91,7 +92,7 @@ STATE = {}
 LAST_LEAD = {}
 LOCK = threading.Lock()
 
-CLUB = "Нижегородская ул., 29/33, стр. 3"
+CLUB = "Нижегородская ул., 29–33, стр. 3"
 PHONE = "+7 (495) 795-69-57"
 GIFT = "год в подарок"
 SCHEDULE_CHANNEL = "https://t.me/sandowfit"
@@ -141,6 +142,8 @@ GOALS = {
 DIRS = {
     "gym": ("Тренажёрный зал",
             "Зал 1100 м²: свободные веса, тренажёры, помост для становой и приседа."),
+    "shape": ("Снижение веса",
+              "Кардиогалерея, тренажёрный зал 1100 м², сауна для восстановления."),
     "group": ("Групповые программы",
               "Три отдельных зала. Расписание пришлём — там видно, что идёт в ваше время."),
     "fight": ("Бокс и кикбоксинг",
@@ -148,6 +151,38 @@ DIRS = {
     "any": ("Ещё не решил",
             "Это нормально — на визите покажем всё и подскажем, с чего начать."),
 }
+
+# Раздел 2.2 сценария (Тренер Хаб\БОТ-сценарий-реплик-26.09.md, утверждено
+# 27.09): развёрнутый ответ-ценность сразу после выбора категории — то,
+# чего не хватало в сокращённой версии 15.08. Показывается один раз, потом
+# человек выбирает формат знакомства.
+VALUE_TEXT = {
+    "gym": ("Тренажёрный зал у нас 1100 м² — очередей к тренажёрам не бывает. "
+            "В карту уже включены стартовые тренировки с личным тренером — "
+            "по желанию: хотите — начните с них, хотите — тренируйтесь "
+            "полностью самостоятельно, а тренера подключите, когда посчитаете нужным."),
+    "shape": ("Для этой задачи у нас есть всё: кардиогалерея с проекторами, "
+              "тренажёрный зал 1100 м² и сауна для восстановления. А если "
+              "захотите поддержку — в карту уже включены стартовые тренировки "
+              "с личным тренером: он соберёт программу под вашу цель."),
+    "group": ("У нас три зала групповых программ: зумба, «здоровая спина», "
+              "танцевальные и силовые классы — всё входит в карту. И стартовые "
+              "тренировки с личным тренером тоже включены — воспользуетесь, "
+              "если захотите: никто ничего не навязывает."),
+    "fight": ("Бойцовский клуб у нас 500 м²: октагон, татами, семь мешков — "
+              "для самостоятельных тренировок это входит в карту. Есть группы "
+              "по кикбоксингу, ММА и грэпплингу. Приходите посмотреть — такого "
+              "пространства нет больше нигде в районе."),
+    "any": ("Тогда самое правильное — увидеть клуб своими глазами: 2500 м², "
+            "круглосуточный режим, сауна. Экскурсия ни к чему не обязывает, "
+            "займёт 20 минут."),
+}
+
+# Слоты для предварительной записи — координатор сверяет и подтверждает
+# вручную в течение часа (раздел 2.5 сценария), поэтому реального календаря
+# тренеров бот на старте не требует.
+SLOTS_TRAINING = ["10:00", "12:00", "14:00", "16:00", "17:30", "19:30"]
+SLOTS_TOUR = ["10:00", "12:00", "14:00", "17:00", "19:00", "21:00"]
 
 
 # Тематические входы с лендингов: t.me/sandowclub_bot?start=<код>.
@@ -447,6 +482,7 @@ def step_gate(chat_id, name, theme=None):
         reply_markup=kb([
             [("Хочу в клуб", "seg:new")],
             [("Уже занимаюсь", "seg:member")],
+            [("Связаться с менеджером", "bridge")],
         ]))
 
 
@@ -516,20 +552,42 @@ def step_goal(chat_id, message_id, intro=False):
 
 
 def step_dir(chat_id, message_id, goal, intro=False):
-    # Сокращение 15.08 по тесту Ольги: путь был в 5 шагов, клиент не доходил.
-    # Вопрос о цели убран (её выясняет менеджер в звонке) — остался один вопрос.
-    text = ("Подберу вам первые визиты — один вопрос.\n\nС чего начнёте?"
-            if intro else "С чего начнёте?")
+    # Раздел 2.1 сценария (26.09, утверждено 27.09): вопрос о задаче
+    # возвращён — но не как раньше (менеджер выясняет по звонку), а с
+    # немедленным ответом-ценностью (step_value) сразу по выбору, до
+    # телефона. Категория «Снижение веса» добавлена — её не было в версии
+    # 15.08. «goal» больше не используется предметно, оставлен параметром
+    # только чтобы не ломать редкие внешние вызовы (deep-link «combat»).
+    text = ("Отлично! Что вам ближе? Под вашу задачу подберём тренера и программу."
+            if intro else "Что вам ближе?")
     api("editMessageText", chat_id=chat_id, message_id=message_id,
         text=text, reply_markup=kb([
             [("Тренажёрный зал", f"d:gym:{goal}")],
+            [("Снижение веса", f"d:shape:{goal}")],
             [("Групповые программы", f"d:group:{goal}")],
-            [("Бокс и кикбоксинг", f"d:fight:{goal}")],
-            [("Ещё не решил", f"d:any:{goal}")],
+            [("Единоборства", f"d:fight:{goal}")],
+            [("Пока просто смотрю", f"d:any:{goal}")],
         ]))
 
 
-def step_phone(chat_id, message_id, goal, direction):
+def step_value(chat_id, message_id, direction):
+    """Раздел 2.2: ответ-ценность по выбранной категории, затем выбор формата
+    знакомства. Приоритет — тренировка с тренером, её кнопка всегда первая
+    (концепция клуба: каждый новый человек проходит через тренера)."""
+    with LOCK:
+        STATE.setdefault(chat_id, {})["dir"] = direction
+    text = VALUE_TEXT.get(direction, VALUE_TEXT["any"])
+    tail = ("\n\nЛучший способ познакомиться с клубом — первая тренировка "
+            "с тренером, она в подарок. Или можно просто прийти посмотреть "
+            "клуб. Как вам удобнее?")
+    api("editMessageText", chat_id=chat_id, message_id=message_id,
+        text=text + tail, reply_markup=kb([
+            [("Тренировка с тренером — в подарок", f"fmt:t:{direction}")],
+            [("Посмотреть клуб", f"fmt:v:{direction}")],
+        ]))
+
+
+def step_phone(chat_id, message_id, goal, direction, fmt="training"):
     # Вопрос квиза удаляем: в чате остаётся ровно ОДНО сообщение — финал.
     # Первая строка — тёплый отклик на выбор: человек видит, что его услышали.
     warm = {
@@ -538,30 +596,168 @@ def step_phone(chat_id, message_id, goal, direction):
         "fight": "Уважаем — бокс закаляет 🥊",
         "any": "И правильно — попробуете всё и поймёте, что ваше 👍",
     }.get(direction, "Отличный план 👍")
-    dname = DIRS.get(direction, DIRS["any"])[0].lower()
-    # «начнёте с направления „ещё не решил“» звучит нелепо — для этого
-    # варианта направление не называем, тёплая строка уже всё сказала.
-    # Вопроса о цели больше нет — упоминаем только направление.
-    fixed = ("" if direction == "any"
-             else f"Записал: начнёте с направления «{dname}».")
+    with LOCK:
+        STATE.setdefault(chat_id, {})["fmt"] = fmt
     api("deleteMessage", chat_id=chat_id, message_id=message_id)
-    body = f"{warm}\n{fixed}\n\n" if fixed else f"{warm}\n\n"
-    # Уточнение Ольги 26.09.2026: «Первое занятие в любом случае
-    # бесплатно» — в любом направлении, не только в боксе. Говорим об
-    # этом здесь, сразу после выбора направления: человек уже назвал, с
-    # чего начнёт, и строка отвечает ровно на его выбор. На первый экран
-    # не выносим — там главный оффер «Год в подарок», и два обещания
-    # рядом размывают друг друга (решение Ольги «добавить точечно»).
+    # Раздел 2.3: контакт берём сразу после выбора формата — страховка от
+    # потери лида. Текст различается для тренировки и экскурсии (2.3а/2.3б),
+    # но само поле телефона обязательное в обоих случаях (решение Ольги 27.09).
+    lead_in = (f"{warm}\n\n🎁 Первая тренировка с тренером — в подарок.\n\n"
+               if fmt == "training" else f"{warm}\n\n")
     api("sendMessage", chat_id=chat_id, parse_mode="HTML",
-        text=(body +
-              "Первое занятие — бесплатное.\n\n"
-              "🎁 <b>Сейчас у нас год в подарок.</b>\n\n"
-              "Оставьте номер — менеджер перезвонит и всё расскажет.\n\n"
+        text=(lead_in +
+              "Оставьте, пожалуйста, имя и номер телефона — закреплю за вами "
+              "время, и продолжим.\n\n"
               "Отправляя номер, вы соглашаетесь на обработку персональных данных."),
         reply_markup=ASK_PHONE)
 
 
+def ask_health(chat_id, name):
+    """Раздел 2.3а: необязательный вопрос о здоровье, ПОСЛЕ телефона, только
+    для формата «тренировка». Ответ ни на что не влияет, просто передаётся
+    фитнес-эксперту и менеджеру (решение Ольги 27.09 — писать в 1С полностью)."""
+    with LOCK:
+        STATE.setdefault(chat_id, {})["await_health"] = True
+    hi = f"Спасибо, {name}!" if name else "Спасибо!"
+    api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+        text=(f"{hi} Чтобы фитнес-эксперт подготовился к встрече: есть ли "
+              "особенности здоровья, о которых ему важно знать — спина, "
+              "суставы, давление? Если нет — просто напишите «нет»."))
+
+
+def step_time(chat_id, fmt):
+    api("sendMessage", chat_id=chat_id, text="Когда вам удобнее?",
+        reply_markup=kb([
+            [("Будни", f"tp:wd:{fmt}")],
+            [("Выходные", f"tp:we:{fmt}")],
+        ]))
+
+
+def step_slots(chat_id, message_id, period, fmt):
+    slots = SLOTS_TRAINING if fmt == "training" else SLOTS_TOUR
+    rows = [[(t, f"sl:{fmt}:{period}:{t}")] for t in slots]
+    rows.append([("Своё время", f"sl:{fmt}:{period}:own")])
+    label = "в будни" if period == "wd" else "в выходные"
+    api("editMessageText", chat_id=chat_id, message_id=message_id,
+        text=f"Выберите время {label}:", reply_markup=kb(rows))
+
+
+def push_1c_followup(phone, extra_comment):
+    """Доклейка деталей (здоровье, время) второй заявкой по тому же телефону —
+    тем же способом, каким archive_dialog доклеивает переписку (1С сама
+    привязывает по номеру, отдельный вебхук на «обновление» недоступен)."""
+    if not (ONEC_WEBHOOK and phone):
+        return
+    try:
+        requests.post(ONEC_WEBHOOK, timeout=25, data={
+            "Name": "Уточнение к заявке из Telegram-бота",
+            "Phone": re.sub(r"\D", "", phone),
+            "Comment": extra_comment,
+            "source": ONEC_SOURCE,
+            "formname": "Telegram-бот сайта — уточнение",
+            "formid": "sandow_lead_bot_followup",
+            "tranid": f"tg-followup-{phone}-{int(time.time())}",
+        })
+    except Exception as exc:
+        print(f"[1c-followup] {exc}", flush=True)
+
+
+def finalize_booking(chat_id, message_id, user, st):
+    fmt = st.get("fmt", "training")
+    direction = st.get("dir", "any")
+    phone = st.get("phone") or lookup_phone(user.get("id"))
+    health = st.get("health", "")
+    time_pref = st.get("time_pref", "не указано")
+    name = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
+    who_client = user.get("first_name") or ""
+
+    if fmt == "training":
+        client_text = (
+            f"Принято{', ' + who_client if who_client else ''}! Предварительно — {time_pref}. "
+            "Сверю время с расписанием фитнес-эксперта и подтвержу здесь же в "
+            "течение часа. Если окно окажется занято — предложу ближайшее соседнее.")
+    else:
+        client_text = (f"Готово{', ' + who_client if who_client else ''}! "
+                        f"Ждём вас — {time_pref}. Подтвержу здесь же в течение часа.")
+    if message_id:
+        api("editMessageText", chat_id=chat_id, message_id=message_id, text=client_text)
+    else:
+        api("sendMessage", chat_id=chat_id, text=client_text)
+
+    kind = "Тренировка с тренером" if fmt == "training" else "Экскурсия"
+    lines = [
+        f"📅 <b>ЗАПИСЬ: {kind.upper()}</b>",
+        f"<b>Имя:</b> {name}",
+        f"<b>Телефон:</b> <code>{phone or 'не оставлял'}</code>",
+        f"<b>Направление:</b> {DIRS.get(direction, DIRS['any'])[0]}",
+        f"<b>Время:</b> {time_pref}",
+    ]
+    if health:
+        lines.append(f"<b>Особенности здоровья:</b> {health}")
+    lines.append("\nКоординатор/менеджер — подтвердите время клиенту одним нажатием:")
+    r = send_to_orders(parse_mode="HTML", text="\n".join(lines),
+                        reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
+    booking_mid = (r.get("result") or {}).get("message_id")
+
+    with LOCK:
+        STATE[chat_id] = {
+            "segment": "new", "dir": direction, "fmt": fmt, "phone": phone,
+            "time_pref": time_pref, "health": health,
+            "booking_mid": booking_mid, "client_name": who_client,
+        }
+    extra = (f"Формат: {kind}. Время: {time_pref}."
+             + (f" Особенности здоровья: {health}." if health else ""))
+    push_1c_followup(phone, extra)
+
+
+def slot_chosen(chat_id, message_id, user, fmt, period, hhmm):
+    if hhmm == "own":
+        with LOCK:
+            STATE.setdefault(chat_id, {})["await_own_time"] = True
+        return api("editMessageText", chat_id=chat_id, message_id=message_id,
+                   text="Напишите день и время словами — передам координатору.")
+    day_label = "ближайшие будни" if period == "wd" else "ближайшие выходные"
+    with LOCK:
+        st = STATE.setdefault(chat_id, {})
+        st["time_pref"] = f"{day_label}, {hhmm}"
+        snapshot = dict(st)
+    finalize_booking(chat_id, message_id, user, snapshot)
+
+
+def coordinator_confirm(group_chat_id, message_id, target_chat_id, who):
+    """Координатор/менеджер нажал «Подтвердить время» в группе — клиенту
+    уходит финальное подтверждение (раздел 2.5), адрес — ссылкой на карту
+    (геометки и фото входа на старте нет: нет готового файла и координат —
+    честно заменено ссылкой, не выдумано)."""
+    with LOCK:
+        st = STATE.get(target_chat_id, {})
+        fmt = st.get("fmt", "training")
+        time_pref = st.get("time_pref", "")
+        name = st.get("client_name", "")
+    maps_url = "https://yandex.ru/maps/?text=" + _url_quote(f"Москва, {CLUB}")
+    hi = f"Подтверждаю, {name}" if name else "Подтверждаю"
+    if fmt == "training":
+        text = (f"{hi}: {time_pref}. Возьмите спортивную форму, кроссовки и "
+                f"паспорт — он нужен для оформления гостевого визита.\n"
+                f"Адрес: Москва, {CLUB}. Маршрут: {maps_url}\n"
+                "Вас встретит менеджер и познакомит с фитнес-экспертом. Накануне напомню!")
+    else:
+        text = (f"{hi}: {time_pref}. Возьмите с собой паспорт — он нужен для "
+                f"оформления визита.\nАдрес: Москва, {CLUB}. Маршрут: {maps_url}\n"
+                "Вас встретит менеджер. Накануне напомню. До встречи!")
+    api("sendMessage", chat_id=target_chat_id, text=text)
+    who_name = who.get("first_name", "менеджер")
+    api("editMessageReplyMarkup", chat_id=group_chat_id, message_id=message_id,
+        reply_markup=kb([[(f"✅ Подтверждено: {who_name}", "noop")]]))
+
+
 def step_done(chat_id, name):
+    # НЕ ВЫЗЫВАЕТСЯ с 28.09.2026: путь «новый клиент» теперь идёт через
+    # ask_health → step_time → step_slots → finalize_booking (сценарий
+    # координатора, БОТ-сценарий-реплик-26.09.md), а finalize_booking сама
+    # шлёт финальное сообщение клиенту. Функция оставлена как справка и на
+    # случай отката, как раньше держали step_hello.
+    #
     # Сокращение 15.08: вопрос «как обращаться?» убран (имя берём из Телеграма,
     # остальное менеджер уточнит в звонке) — сразу мост в клубный Телеграм.
     # Тексты моста согласованы Ольгой: коротко, кнопка сама говорит, что делать.
@@ -845,7 +1041,7 @@ def _segment(chat_id):
 
 # ------------------------------------------------------------------- заявка
 
-def send_to_1c(user, phone, goal, direction, source="", метки=None):
+def send_to_1c(user, phone, goal, direction, source="", метки=None, fmt=""):
     """Заводит заявку в 1С:Фитнес клуб. Возвращает приписку к сообщению в группе.
 
     Данные уходят формой — тем же способом, каким шлёт Тильда. JSON приёмник
@@ -855,12 +1051,15 @@ def send_to_1c(user, phone, goal, direction, source="", метки=None):
         return ""
 
     name = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x).strip()
+    fmt_line = {"training": " Формат: тренировка с тренером (в подарок).",
+                "tour": " Формат: экскурсия по клубу."}.get(fmt, "")
     data = {
         "Name": name or "Без имени",
         "Phone": re.sub(r"\D", "", phone or ""),
         "Comment": (f"Заявка из Telegram-бота. Подарок: {GIFT}. "
                     f"Задача: {GOALS.get(goal, 'не указана')}. "
                     f"Начнёт с: {DIRS.get(direction, DIRS['any'])[0]}."
+                    + fmt_line
                     + (f" Источник: {source}." if source else "")),
         "source": ONEC_SOURCE,
         "utm_source": "telegram",
@@ -891,11 +1090,14 @@ def send_to_1c(user, phone, goal, direction, source="", метки=None):
         return "\n\n⚠️ В 1С не попало (нет связи) — занесите вручную"
 
 
-def send_lead(user, phone, goal, direction, source=""):
+def send_lead(user, phone, goal, direction, source="", fmt=""):
     who = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
     uname = f"@{user['username']}" if user.get("username") else "без ника"
     now = datetime.now(MSK).strftime("%d.%m в %H:%M")
     src_line = f"<b>Источник:</b> {source}\n" if source else ""
+    fmt_label = {"training": "Тренировка с тренером (в подарок)",
+                 "tour": "Экскурсия по клубу"}.get(fmt, "")
+    fmt_line = f"<b>Формат:</b> {fmt_label}\n" if fmt_label else ""
     text = (
         "🎁 <b>ЗАЯВКА ИЗ TELEGRAM-БОТА</b>\n\n"
         f"<b>Имя:</b> {who}\n"
@@ -903,10 +1105,13 @@ def send_lead(user, phone, goal, direction, source=""):
         f"<b>Подарок:</b> {GIFT}\n"
         f"<b>Задача:</b> {GOALS.get(goal, 'не указана')}\n"
         f"<b>Начнёт с:</b> {DIRS.get(direction, DIRS['any'])[0]}\n"
+        f"{fmt_line}"
         f"{src_line}\n"
-        f"Telegram: {uname} · {now}"
+        f"Telegram: {uname} · {now}\n"
+        "Здоровье и время визита придут отдельным уточнением, как только "
+        "клиент ответит."
     )
-    text += send_to_1c(user, phone, goal, direction, source)
+    text += send_to_1c(user, phone, goal, direction, source, fmt=fmt)
     r = send_to_orders(text=text, parse_mode="HTML",
                         reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
     log_lead_event(user.get("id"), "lead_created", phone=phone)
@@ -1593,7 +1798,26 @@ def on_button(cq):
         _, direction, goal = data.split(":", 2)
         with LOCK:
             STATE.setdefault(chat_id, {}).update({"goal": goal, "dir": direction})
-        return step_phone(chat_id, mid, goal, direction)
+        return step_value(chat_id, mid, direction)
+
+    if data.startswith("fmt:"):
+        _, code, direction = data.split(":", 2)
+        fmt = "training" if code == "t" else "tour"
+        with LOCK:
+            STATE.setdefault(chat_id, {}).update({"dir": direction, "fmt": fmt})
+        return step_phone(chat_id, mid, "", direction, fmt=fmt)
+
+    if data.startswith("tp:"):
+        _, period, fmt = data.split(":", 2)
+        return step_slots(chat_id, mid, period, fmt)
+
+    if data.startswith("sl:"):
+        _, fmt, period, hhmm = data.split(":", 3)
+        return slot_chosen(chat_id, mid, user, fmt, period, hhmm)
+
+    if data.startswith("confirmvisit:"):
+        target = int(data.split(":", 1)[1])
+        return coordinator_confirm(chat_id, mid, target, user)
 
     if data.startswith("ack:"):
         with LOCK:
@@ -1704,6 +1928,37 @@ def on_message(msg):
                    text="Мы уже на связи в клубном чате — продолжим там 🙂",
                    reply_markup=markup)
 
+    # Раздел 2.3а: ждём ответ на вопрос о здоровье. Не влияет на запись —
+    # что бы человек ни написал, идём дальше к выбору времени.
+    with LOCK:
+        st = STATE.get(chat_id, {})
+        awaiting_health = st.get("await_health")
+    if awaiting_health and text and not text.startswith("/"):
+        with LOCK:
+            st = STATE.setdefault(chat_id, {})
+            st.pop("await_health", None)
+            health = "" if text.strip().lower() in ("нет", "нету", "-", "нет.") else text.strip()
+            st["health"] = health
+            lead_mid = st.get("lead_mid")
+        if health and lead_mid:
+            send_to_orders(parse_mode="HTML",
+                text=f"🩺 <b>Особенности здоровья</b> (от клиента): {health}",
+                reply_to_message_id=lead_mid)
+        return step_time(chat_id, st.get("fmt", "training"))
+
+    # Раздел 2.3б/«Своё время»: человек не выбрал готовый слот, а пишет
+    # день и время словами — передаём координатору как есть.
+    with LOCK:
+        st = STATE.get(chat_id, {})
+        awaiting_own_time = st.get("await_own_time")
+    if awaiting_own_time and text and not text.startswith("/"):
+        with LOCK:
+            st = STATE.setdefault(chat_id, {})
+            st.pop("await_own_time", None)
+            st["time_pref"] = text.strip()
+            snapshot = dict(st)
+        return finalize_booking(chat_id, None, user, snapshot)
+
     # после заявки спросили, как обращаться — ловим ответ. Необязательный шаг:
     # что бы человек ни написал дальше, заявка уже ушла и ничего не теряется.
     with LOCK:
@@ -1796,6 +2051,7 @@ def finish(chat_id, user, phone):
     with LOCK:
         st = STATE.get(chat_id, {})
     goal, direction = st.get("goal", "keep"), st.get("dir", "any")
+    fmt = st.get("fmt", "training")
     source = LANDINGS.get(st.get("src"), ("",))[0]
     if too_soon(user.get("id")):
         return api("sendMessage", chat_id=chat_id,
@@ -1803,12 +2059,19 @@ def finish(chat_id, user, phone):
                         f"Если срочно, наберите нас: {PHONE}",
                    reply_markup={"remove_keyboard": True})
     save_subscriber(user, segment="new", phone=phone)
-    lead_mid = send_lead(user, phone, goal, direction, source)
-    step_done(chat_id, user.get("first_name"))
+    # Раздел 2.3: заявка в 1С заводится сразу по номеру — здоровье и время
+    # (если формат «тренировка») доклеиваются в неё позже, а не ждут,
+    # пока человек ответит на все вопросы до конца.
+    lead_mid = send_lead(user, phone, goal, direction, source, fmt=fmt)
     with LOCK:
-        st = STATE.get(chat_id, {})
-        seg = st.get("segment")
-        STATE[chat_id] = {"segment": seg, "lead_mid": lead_mid}
+        STATE[chat_id] = {
+            "segment": "new", "dir": direction, "fmt": fmt, "phone": phone,
+            "lead_mid": lead_mid, "client_name": user.get("first_name", ""),
+        }
+    if fmt == "training":
+        ask_health(chat_id, user.get("first_name"))
+    else:
+        step_time(chat_id, fmt)
 
 
 # ── Заявка с сайта ──────────────────────────────────────────────────────────
@@ -2011,7 +2274,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-27-v20-sla-site-leads"
+VERSION = "2026-09-28-v21-coordinator-scenario"
 
 
 @app.route("/health")
