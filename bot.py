@@ -409,6 +409,24 @@ def gh_write_json(path, data, message):
         print(f"[gh] запись {path}: {exc}", flush=True)
 
 
+_ACTIVE_MGR = {"name": None, "ts": 0}
+
+
+def active_manager_name():
+    """Кто сейчас «активный» менеджер по графику ОП (data/op_active_manager.json,
+    считает workflow «График ОП» в sandow-lp раз в 20 минут — читаем готовое,
+    сам бот с Google Таблицей не работает). Кэш 5 минут, чтобы не дёргать
+    GitHub на каждое уведомление. Пусто/ошибка — тихо возвращаем None,
+    уведомление в группу тогда идёт без имени, как раньше (не ломаем поток)."""
+    if time.time() - _ACTIVE_MGR["ts"] < 300:
+        return _ACTIVE_MGR["name"]
+    data = gh_read_json("data/op_active_manager.json", default=None)
+    name = (data or {}).get("active_manager")
+    _ACTIVE_MGR["name"] = name
+    _ACTIVE_MGR["ts"] = time.time()
+    return name
+
+
 def save_subscriber(user, segment=None, phone=None, call_name=None, source=None):
     """Дописывает или обновляет запись о человеке в базе подписчиков.
 
@@ -643,15 +661,17 @@ def schedule_dropoff_watch(chat_id, delay=900):
             phone, name = st.get("phone"), st.get("client_name", "")
             direction, fmt = st.get("dir", "any"), st.get("fmt", "training")
         kind = "тренировка с тренером" if fmt == "training" else "экскурсия по клубу"
+        active = active_manager_name()
+        who_line = f"\n{active} — вы сейчас активный менеджер, перезвоните:" if active \
+            else "\n15 минут не отвечает боту дальше — похоже, отвлёкся. Перезвоните."
 
         def _send():
             send_to_orders(parse_mode="HTML",
                 text=(f"📵 <b>ОСТАВИЛ НОМЕР, ЗАПИСЬ НЕ ЗАВЕРШИЛ</b>\n"
                       f"<b>Имя:</b> {name or 'без имени'}\n"
                       f"<b>Телефон:</b> <code>{phone}</code>\n"
-                      f"<b>Хотел:</b> {kind}, {DIRS.get(direction, DIRS['any'])[0]}\n\n"
-                      "15 минут не отвечает боту дальше — похоже, отвлёкся. "
-                      "Перезвоните."),
+                      f"<b>Хотел:</b> {kind}, {DIRS.get(direction, DIRS['any'])[0]}\n"
+                      f"{who_line}"),
                 reply_markup=kb([[("Беру в работу", f"take:{chat_id}")]]))
         # Тихие часы (22:00–10:00) — как и другие отложенные уведомления
         # бота (bridge_on): не будим менеджеров ночью из-за молчания клиента.
@@ -747,7 +767,9 @@ def finalize_booking(chat_id, message_id, user, st):
     if fmt == "training":
         lines.append(f"\n{COORDINATOR_TG} — подтвердите время клиенту одним нажатием:")
     else:
-        lines.append("\nМенеджер — подтвердите время клиенту одним нажатием:")
+        active = active_manager_name()
+        who = f"{active} — вы активный менеджер сейчас, подтвердите" if active else "Менеджер — подтвердите"
+        lines.append(f"\n{who} время клиенту одним нажатием:")
     r = send_to_orders(parse_mode="HTML", text="\n".join(lines),
                         reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
     booking_mid = (r.get("result") or {}).get("message_id")
@@ -2421,7 +2443,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v27-coordinator-mention"
+VERSION = "2026-09-28-v28-active-manager"
 
 
 @app.route("/health")
