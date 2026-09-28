@@ -622,6 +622,34 @@ def step_phone(chat_id, message_id, goal, direction, fmt="training"):
         reply_markup=ASK_PHONE)
 
 
+def schedule_dropoff_watch(chat_id, delay=900):
+    """Правка Ольги 28.09: клиент, который оставил телефон и продолжает
+    отвечать боту (здоровье, время), звонка не ждёт — уведомлять менеджеров
+    сразу значит заставлять их звонить тем, кто и не рассчитывает на звонок.
+    Через 15 минут тишины, если запись так и не завершена (нет
+    booking_mid), — это и есть признак «отвалился»: тогда телефон уходит
+    в рабочий чат, но с явной пометкой, что это не завершённая запись,
+    а человек, переставший отвечать."""
+    def _check():
+        with LOCK:
+            st = STATE.get(chat_id, {})
+            if st.get("booking_mid") or st.get("dropoff_alerted") or not st.get("phone"):
+                return
+            st["dropoff_alerted"] = True
+            phone, name = st.get("phone"), st.get("client_name", "")
+            direction, fmt = st.get("dir", "any"), st.get("fmt", "training")
+        kind = "тренировка с тренером" if fmt == "training" else "экскурсия по клубу"
+        send_to_orders(parse_mode="HTML",
+            text=(f"📵 <b>ОСТАВИЛ НОМЕР, ЗАПИСЬ НЕ ЗАВЕРШИЛ</b>\n"
+                  f"<b>Имя:</b> {name or 'без имени'}\n"
+                  f"<b>Телефон:</b> <code>{phone}</code>\n"
+                  f"<b>Хотел:</b> {kind}, {DIRS.get(direction, DIRS['any'])[0]}\n\n"
+                  "15 минут не отвечает боту дальше — похоже, отвлёкся. "
+                  "Перезвоните."),
+            reply_markup=kb([[("Беру в работу", f"take:{chat_id}")]]))
+    threading.Timer(delay, _check).start()
+
+
 def ask_health(chat_id, name):
     """Раздел 2.3а: необязательный вопрос о здоровье, ПОСЛЕ телефона, только
     для формата «тренировка». Ответ ни на что не влияет, просто передаётся
@@ -2038,12 +2066,12 @@ def on_message(msg):
             st.pop("await_health", None)
             health = "" if text.strip().lower() in ("нет", "нету", "-", "нет.") else text.strip()
             st["health"] = health
-            lead_mid = st.get("lead_mid")
-        if health and lead_mid:
-            send_to_orders(parse_mode="HTML",
-                text=f"🩺 <b>Особенности здоровья</b> (от клиента): {health}",
-                reply_to_message_id=lead_mid)
-        return step_time(chat_id, st.get("fmt", "training"))
+            fmt = st.get("fmt", "training")
+        # В рабочий чат здоровье отдельно НЕ шлём — оно уже попадёт в общую
+        # карточку записи (finalize_booking), когда клиент выберет время.
+        # Ранняя отправка была ровно тем, из-за чего менеджер думал, что
+        # нужно звонить прямо сейчас, хотя клиент ещё отвечает боту.
+        return step_time(chat_id, fmt)
 
     # Раздел 2.3б/«Своё время»: человек не выбрал готовый слот, а пишет
     # день и время словами — передаём координатору как есть.
@@ -2158,15 +2186,20 @@ def finish(chat_id, user, phone):
                         f"Если срочно, наберите нас: {PHONE}",
                    reply_markup={"remove_keyboard": True})
     save_subscriber(user, segment="new", phone=phone)
-    # Раздел 2.3: заявка в 1С заводится сразу по номеру — здоровье и время
-    # (если формат «тренировка») доклеиваются в неё позже, а не ждут,
-    # пока человек ответит на все вопросы до конца.
-    lead_mid = send_lead(user, phone, goal, direction, source, fmt=fmt)
+    # Правка Ольги 28.09: заявка в 1С заводится сразу по номеру (не терять
+    # данные), но РАБОЧИЙ ЧАТ не уведомляется сразу — человек ещё отвечает
+    # боту (здоровье, время), менеджеру рано звонить, он решит, что клиент
+    # ждёт звонка, а тот просто продолжает диалог. Уведомление уходит
+    # только: (а) когда запись реально оформлена — finalize_booking,
+    # (б) если человек замолчал на 15 минут, не дойдя до конца — watchdog.
+    send_to_1c(user, phone, goal, direction, source, fmt=fmt)
+    log_lead_event(user.get("id"), "lead_created", phone=phone)
     with LOCK:
         STATE[chat_id] = {
             "segment": "new", "dir": direction, "fmt": fmt, "phone": phone,
-            "lead_mid": lead_mid, "client_name": user.get("first_name", ""),
+            "client_name": user.get("first_name", ""),
         }
+    schedule_dropoff_watch(chat_id)
     if fmt == "training":
         ask_health(chat_id, user.get("first_name"))
     else:
@@ -2373,7 +2406,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v23-no-internal-kitchen"
+VERSION = "2026-09-28-v24-delayed-notify"
 
 
 @app.route("/health")
