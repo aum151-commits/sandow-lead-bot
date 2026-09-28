@@ -95,6 +95,10 @@ LOCK = threading.Lock()
 CLUB = "Нижегородская ул., 29–33, стр. 3"
 PHONE = "+7 (495) 795-69-57"
 GIFT = "год в подарок"
+# Координатор тренажёрного зала — назначает фитнес-эксперта на запись.
+# Ник, не chat_id: бот не в личке с ней, упоминание работает прямо в
+# группе «Sandow заявки» (решение Ольги 28.09.2026).
+COORDINATOR_TG = "@salikhovadaria"
 SCHEDULE_CHANNEL = "https://t.me/sandowfit"
 FREEZE_URL = "https://sandowfitness.ru/zamorozka"
 
@@ -737,7 +741,13 @@ def finalize_booking(chat_id, message_id, user, st):
     ]
     if health:
         lines.append(f"<b>Особенности здоровья:</b> {health}")
-    lines.append("\nКоординатор/менеджер — подтвердите время клиенту одним нажатием:")
+    # Тренировку с тренером назначает координатор зала — упоминаем её по
+    # нику прямо в карточке (решение Ольги 28.09: проще прямого упоминания
+    # в группе, чем городить отдельную личную рассылку через бота).
+    if fmt == "training":
+        lines.append(f"\n{COORDINATOR_TG} — подтвердите время клиенту одним нажатием:")
+    else:
+        lines.append("\nМенеджер — подтвердите время клиенту одним нажатием:")
     r = send_to_orders(parse_mode="HTML", text="\n".join(lines),
                         reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
     booking_mid = (r.get("result") or {}).get("message_id")
@@ -1866,8 +1876,8 @@ def on_button(cq):
         label = "уже занимается с экспертом" if already else "НИКОГДА не занимался — вводная ПТ в подарок"
         send_to_orders(parse_mode="HTML",
             text=f"🏋️ <b>ЗАПИСЬ НА ТРЕНИРОВКУ (член клуба)</b>\n{member_card_line(user)}\n"
-                 f"Статус: {label}.\nСогласуйте время с клиентом реплаем — уйдёт в бот.\n"
-                 f"#id{chat_id}")
+                 f"Статус: {label}.\n{COORDINATOR_TG} — согласуйте время с клиентом "
+                 f"реплаем, ответ уйдёт в бот.\n#id{chat_id}")
         with LOCK:
             STATE.setdefault(chat_id, {})["bridge"] = True
         return api("editMessageText", chat_id=chat_id, message_id=mid, text=note)
@@ -2411,7 +2421,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v26-self-ping-standalone"
+VERSION = "2026-09-28-v27-coordinator-mention"
 
 
 @app.route("/health")
