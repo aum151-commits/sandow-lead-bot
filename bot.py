@@ -639,14 +639,19 @@ def schedule_dropoff_watch(chat_id, delay=900):
             phone, name = st.get("phone"), st.get("client_name", "")
             direction, fmt = st.get("dir", "any"), st.get("fmt", "training")
         kind = "тренировка с тренером" if fmt == "training" else "экскурсия по клубу"
-        send_to_orders(parse_mode="HTML",
-            text=(f"📵 <b>ОСТАВИЛ НОМЕР, ЗАПИСЬ НЕ ЗАВЕРШИЛ</b>\n"
-                  f"<b>Имя:</b> {name or 'без имени'}\n"
-                  f"<b>Телефон:</b> <code>{phone}</code>\n"
-                  f"<b>Хотел:</b> {kind}, {DIRS.get(direction, DIRS['any'])[0]}\n\n"
-                  "15 минут не отвечает боту дальше — похоже, отвлёкся. "
-                  "Перезвоните."),
-            reply_markup=kb([[("Беру в работу", f"take:{chat_id}")]]))
+
+        def _send():
+            send_to_orders(parse_mode="HTML",
+                text=(f"📵 <b>ОСТАВИЛ НОМЕР, ЗАПИСЬ НЕ ЗАВЕРШИЛ</b>\n"
+                      f"<b>Имя:</b> {name or 'без имени'}\n"
+                      f"<b>Телефон:</b> <code>{phone}</code>\n"
+                      f"<b>Хотел:</b> {kind}, {DIRS.get(direction, DIRS['any'])[0]}\n\n"
+                      "15 минут не отвечает боту дальше — похоже, отвлёкся. "
+                      "Перезвоните."),
+                reply_markup=kb([[("Беру в работу", f"take:{chat_id}")]]))
+        # Тихие часы (22:00–10:00) — как и другие отложенные уведомления
+        # бота (bridge_on): не будим менеджеров ночью из-за молчания клиента.
+        send_or_defer(_send)
     threading.Timer(delay, _check).start()
 
 
@@ -2406,7 +2411,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v24-delayed-notify"
+VERSION = "2026-09-28-v25-quiet-hours-dropoff"
 
 
 @app.route("/health")
