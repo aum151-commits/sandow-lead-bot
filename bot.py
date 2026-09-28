@@ -517,23 +517,33 @@ def step_hello(chat_id, message_id=None):
 
 
 def step_member_menu(chat_id, message_id=None, greet=True):
-    """Меню действующего члена клуба. Никаких заявок и продаж — только польза."""
+    """Меню действующего члена клуба. Никаких заявок и продаж — только польза.
+
+    Раздел 4 сценария (26.09, утверждено 27.09): заморозка, справка для
+    вычета, срок абонемента, запись на тренировку — теперь прямо в боте,
+    а не ссылкой (решение Ольги 27.09 «заморозка только через бот»)."""
     text = "Рад видеть своих! Чем помочь?" if greet else "Чем ещё помочь?"
-    # «Написать менеджеру» — через событие: так в группу заявок уходит
-    # уведомление об обращении (требование Ольги), а клиент получает кнопку
-    # перехода в чат клуба. Прямую ссылку Telegram без потери уведомления
-    # не умеет: url-кнопки не сообщают боту о нажатии.
     markup = kb_mixed([
         [("📅 Расписание групповых программ", "url:" + schedule_url())],
-        [("❄️ Заморозка абонемента", "url:" + FREEZE_URL)],
+        [("❄️ Заморозка абонемента", "freeze")],
+        [("🧾 Справка для налогового вычета", "tax_cert")],
+        [("📆 Срок моего абонемента", "member_term")],
+        [("🏋️ Записаться на тренировку", "book_training")],
         [("💬 Написать менеджеру", "bridge")],
-        [("📱 Оставить номер для связи", "member_phone")],
     ])
     if message_id:
         api("editMessageText", chat_id=chat_id, message_id=message_id,
             text=text, reply_markup=markup)
     else:
         api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
+
+
+def member_card_line(user):
+    who = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
+    uname = f"@{user['username']}" if user.get("username") else "без ника"
+    phone = lookup_phone(user.get("id"))
+    pline = f" · <code>{phone}</code>" if phone else " · телефон не оставлял"
+    return f"<b>{who}</b> · {uname}{pline}"
 
 
 def step_goal(chat_id, message_id, intro=False):
@@ -1778,6 +1788,56 @@ def on_button(cq):
                         "Отправляя номер, вы соглашаетесь на обработку персональных данных.",
                    reply_markup=ASK_PHONE)
 
+    if data == "freeze":
+        with LOCK:
+            STATE.setdefault(chat_id, {})["await_freeze"] = True
+        return api("editMessageText", chat_id=chat_id, message_id=mid,
+                   text="С какого числа и на сколько дней оформить заморозку? "
+                        "Напишите, например: «с 5 октября на 14 дней».")
+
+    if data == "tax_cert":
+        with LOCK:
+            STATE.setdefault(chat_id, {})["await_tax_photo"] = True
+        return api("editMessageText", chat_id=chat_id, message_id=mid,
+                   text="Подготовим справку. Пришлите, пожалуйста, фото разворота "
+                        "паспорта (2-я и 3-я страницы) — и передам в работу. "
+                        "Менеджер напишет здесь, когда справка будет готова.\n\n"
+                        "Отправляя фото, вы соглашаетесь на обработку персональных данных.")
+
+    if data == "member_term":
+        send_to_orders(parse_mode="HTML",
+            text=f"📆 <b>СПРОСИЛ СРОК АБОНЕМЕНТА</b>\n{member_card_line(user)}\n"
+                 "Ответьте клиенту реплаем на это сообщение — уйдёт ему в бот.\n"
+                 f"#id{chat_id}")
+        with LOCK:
+            STATE.setdefault(chat_id, {})["bridge"] = True
+        return api("editMessageText", chat_id=chat_id, message_id=mid,
+                   text="Сейчас уточню у менеджера — он ответит вам здесь.")
+
+    if data == "book_training":
+        return api("editMessageText", chat_id=chat_id, message_id=mid,
+                   text="Вы уже занимаетесь с кем-то из наших фитнес-экспертов?",
+                   reply_markup=kb([[("Да", "bt:yes")], [("Нет", "bt:no")]]))
+
+    if data.startswith("bt:"):
+        already = data.split(":", 1)[1] == "yes"
+        note = ("Передам координатору — согласуем время с вашим экспертом."
+                if already else
+                "Тогда у меня хорошая новость: первая тренировка с фитнес-"
+                "экспертом — в подарок. Передам координатору: он подберёт "
+                "эксперта под вашу задачу и предложит время.")
+        # РЕШЕНИЕ ОЛЬГИ 27.09: члену клуба, который никогда не занимался с
+        # тренером В НАШЕМ клубе, вводная тренировка дарится обязательно;
+        # тому, кто уже занимается, — не дарится (фильтр вопросом выше).
+        label = "уже занимается с экспертом" if already else "НИКОГДА не занимался — вводная ПТ в подарок"
+        send_to_orders(parse_mode="HTML",
+            text=f"🏋️ <b>ЗАПИСЬ НА ТРЕНИРОВКУ (член клуба)</b>\n{member_card_line(user)}\n"
+                 f"Статус: {label}.\nСогласуйте время с клиентом реплаем — уйдёт в бот.\n"
+                 f"#id{chat_id}")
+        with LOCK:
+            STATE.setdefault(chat_id, {})["bridge"] = True
+        return api("editMessageText", chat_id=chat_id, message_id=mid, text=note)
+
     if data == "go":
         return step_dir(chat_id, mid, "")
 
@@ -1862,6 +1922,44 @@ def on_message(msg):
     if msg.get("contact"):
         phone = clean_phone(msg["contact"].get("phone_number"))
         return finish(chat_id, user, phone)
+
+    # Раздел 4 «Справка для налогового вычета»: ждём фото разворота паспорта.
+    # Фото пересылается менеджеру, в базе бота не хранится (только у Telegram).
+    photos = msg.get("photo")
+    with LOCK:
+        awaiting_tax_photo = STATE.get(chat_id, {}).get("await_tax_photo")
+    if awaiting_tax_photo and photos:
+        with LOCK:
+            STATE.setdefault(chat_id, {}).pop("await_tax_photo", None)
+        file_id = photos[-1]["file_id"]
+        api("sendPhoto", chat_id=ORDERS_CHAT, photo=file_id, parse_mode="HTML",
+            caption=f"🧾 <b>СПРАВКА ДЛЯ ВЫЧЕТА — фото паспорта</b>\n{member_card_line(user)}\n"
+                    f"Когда справка готова, ответьте клиенту реплаем на это сообщение.\n"
+                    f"#id{chat_id}")
+        return api("sendMessage", chat_id=chat_id,
+                   text="Фото получено, передала в работу. Менеджер напишет здесь, "
+                        "когда справка будет готова.")
+    if awaiting_tax_photo and text and not text.startswith("/"):
+        return api("sendMessage", chat_id=chat_id,
+                   text="Жду именно фото разворота паспорта (2-я и 3-я страницы) — "
+                        "пришлите его картинкой.")
+
+    # Раздел 4 «Заморозка абонемента»: свободный текст с датой и сроком —
+    # менеджер подтверждает оформление, сам бот стоимость не называет
+    # (зависит от формата карты).
+    with LOCK:
+        awaiting_freeze = STATE.get(chat_id, {}).get("await_freeze")
+    if awaiting_freeze and text and not text.startswith("/"):
+        with LOCK:
+            STATE.setdefault(chat_id, {}).pop("await_freeze", None)
+        send_to_orders(parse_mode="HTML",
+            text=f"❄️ <b>ЗАПРОС ЗАМОРОЗКИ</b>\n{member_card_line(user)}\n"
+                 f"Клиент указал: {text}\n"
+                 "Оформите и подтвердите клиенту реплаем на это сообщение.\n"
+                 f"#id{chat_id}")
+        return api("sendMessage", chat_id=chat_id,
+                   text=f"Принято: заморозка — {text}. Менеджер подтвердит "
+                        "оформление здесь же.")
 
     if text.startswith("/start"):
         archive_dialog(chat_id)
@@ -2274,7 +2372,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v21-coordinator-scenario"
+VERSION = "2026-09-28-v22-member-selfservice"
 
 
 @app.route("/health")
