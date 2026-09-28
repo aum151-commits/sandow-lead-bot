@@ -2411,7 +2411,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-28-v25-quiet-hours-dropoff"
+VERSION = "2026-09-28-v26-self-ping-standalone"
 
 
 @app.route("/health")
@@ -2427,6 +2427,30 @@ def health():
                    токен_хранилища=bool(GH_TOKEN),
                    вебхук_1с=bool(ONEC_WEBHOOK),
                    чат_заявок=bool(ORDERS_CHAT))
+
+
+def _self_ping():
+    """Держит бесплатный сервис Render в тонусе — сам стучится на свой
+    публичный адрес каждые ~10 минут, тем же приёмом, что уже работает
+    у sandow-cron (память cloud-scheduler-own-heartbeat, 02.09.2026).
+    Не зависит ни от ноутбука, ни от расписания GitHub Actions (оно
+    достоверно опаздывает на часы вместо минут — известное свойство
+    платформы, не наша поломка). Правка Ольги 28.09.2026: бот теперь
+    на отдельном Render-аккаунте только для себя, поэтому круглосуточный
+    self-ping не делит лимит часов ни с кем ещё."""
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not url:
+        print("[self-ping] RENDER_EXTERNAL_URL не задан — самопробуждение выключено", flush=True)
+        return
+    while True:
+        try:
+            requests.get(f"{url}/health", timeout=30)
+        except Exception as exc:
+            print(f"[self-ping] {exc}", flush=True)
+        time.sleep(600)
+
+
+threading.Thread(target=_self_ping, daemon=True).start()
 
 
 if __name__ == "__main__":
