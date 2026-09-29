@@ -455,22 +455,96 @@ def coordinator_chat_id():
     return found
 
 
-_ACTIVE_MGR = {"name": None, "ts": 0}
+_ACTIVE_MGR = {"data": None, "ts": 0}
+
+
+def _active_mgr_data():
+    """Кэшированное (5 минут) содержимое data/op_active_manager.json —
+    считает workflow «График ОП» в sandow-lp раз в 20 минут, сам бот
+    с Google Таблицей не работает. Общий кэш для active_manager_name()
+    (кто активен сейчас) и manager_for_visit() (кто будет активен в
+    конкретный день/час визита) — незачем дважды ходить в GitHub за
+    одним и тем же файлом."""
+    if time.time() - _ACTIVE_MGR["ts"] < 300 and _ACTIVE_MGR["data"] is not None:
+        return _ACTIVE_MGR["data"]
+    data = gh_read_json("data/op_active_manager.json", default={}) or {}
+    _ACTIVE_MGR["data"] = data
+    _ACTIVE_MGR["ts"] = time.time()
+    return data
 
 
 def active_manager_name():
-    """Кто сейчас «активный» менеджер по графику ОП (data/op_active_manager.json,
-    считает workflow «График ОП» в sandow-lp раз в 20 минут — читаем готовое,
-    сам бот с Google Таблицей не работает). Кэш 5 минут, чтобы не дёргать
-    GitHub на каждое уведомление. Пусто/ошибка — тихо возвращаем None,
-    уведомление в группу тогда идёт без имени, как раньше (не ломаем поток)."""
-    if time.time() - _ACTIVE_MGR["ts"] < 300:
-        return _ACTIVE_MGR["name"]
-    data = gh_read_json("data/op_active_manager.json", default=None)
-    name = (data or {}).get("active_manager")
-    _ACTIVE_MGR["name"] = name
-    _ACTIVE_MGR["ts"] = time.time()
-    return name
+    """Кто сейчас «активный» менеджер — годится звонить прямо сейчас
+    (отвалившаяся запись, подтверждение кнопкой). Для задачи на БУДУЩИЙ
+    визит используйте manager_for_visit — иначе задачу получит тот, кто
+    просто оказался активен в момент клика, а не тот, кто работает в
+    день/час самого визита (расхождение поймала Ольга 29.09.2026)."""
+    return _active_mgr_data().get("active_manager")
+
+
+_WEEKDAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+_SHIFT_HOURS_RE = re.compile(r"^(\d{1,2})-(\d{1,2})$")
+
+
+def resolve_visit_day(period, msk_now=None):
+    """period — ключ дня недели (mon..sun) из кнопок step_time. Возвращает
+    день месяца (int) ближайшего будущего (или сегодняшнего) вхождения
+    этого дня недели, или None, если он проваливается в другой месяц —
+    график месяца в op_active_manager.json содержит только текущий месяц,
+    доверять числу дня из чужого месяца нельзя (может случайно совпасть
+    с другим днём этого месяца)."""
+    idx = _WEEKDAY_INDEX.get(period)
+    if idx is None:
+        return None
+    now = msk_now or datetime.now(MSK)
+    days_ahead = (idx - now.weekday()) % 7
+    target = now.date() + timedelta(days=days_ahead)
+    if target.month != now.month or target.year != now.year:
+        return None
+    return target.day
+
+
+def _rotate_manager(day_managers, hour):
+    """Та же формула ротации, что в op_schedule.py и op_schedule_sync.yml —
+    сознательно продублирована: бот не должен тянуть google-зависимости
+    ради одной функции, а воркфлоу и так уже считает независимо от
+    sandow-lead-bot (см. комментарий в op_schedule_sync.yml)."""
+    working = []
+    for name, rec in (day_managers or {}).items():
+        status = (rec[0] if len(rec) > 0 else "") or ""
+        hrs = (rec[1] if len(rec) > 1 else "") or ""
+        if not str(status).lower().startswith("раб"):
+            continue
+        m = _SHIFT_HOURS_RE.match(str(hrs).strip())
+        if not m:
+            continue
+        working.append((name, int(m.group(1)), int(m.group(2))))
+    covering = [w for w in working if w[1] <= hour < w[2]]
+    if not covering:
+        return None
+    if len(covering) == 1:
+        return covering[0][0]
+    win_start = min(w[1] for w in covering)
+    win_end = max(w[2] for w in covering)
+    span = max(1, win_end - win_start)
+    block = span / len(covering)
+    idx = min(len(covering) - 1, int((hour - win_start) / block))
+    return covering[idx][0]
+
+
+def manager_for_visit(target_day, target_hour):
+    """Кто будет активным менеджером в день/час САМОГО ВИЗИТА, а не в
+    момент, когда координатор нажал «подтвердить» (просьба Ольги 29.09.2026).
+    target_day/target_hour отсутствуют (своё время текстом, старая запись
+    без этих полей) или день вне графика — тихо возвращаем None, вызывающий
+    откатывается на active_manager_name()."""
+    if target_day is None or target_hour is None:
+        return None
+    schedule = _active_mgr_data().get("schedule") or {}
+    day = schedule.get(str(target_day))
+    if not day:
+        return None
+    return _rotate_manager(day, target_hour)
 
 
 def save_subscriber(user, segment=None, phone=None, call_name=None, source=None):
@@ -922,6 +996,12 @@ def slot_chosen(chat_id, message_id, user, fmt, period, hhmm):
     with LOCK:
         st = STATE.setdefault(chat_id, {})
         st["time_pref"] = f"{day_label}, {hhmm}"
+        # Просьба Ольги 29.09: запоминаем день/час САМОГО ВИЗИТА, пока они
+        # ещё структурированы (кнопки), чтобы задача менеджеру потом ушла
+        # тому, кто работает именно тогда, а не тому, кто активен в момент
+        # клика «подтвердить» (manager_for_visit в coordinator_confirm).
+        st["visit_day"] = resolve_visit_day(period)
+        st["visit_hour"] = int(hhmm.split(":")[0])
         member_flow = "member_training_already" in st
         snapshot = dict(st)
     if member_flow:
@@ -942,6 +1022,8 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who):
         phone = st.get("phone", "")
         direction = st.get("dir", "any")
         is_member = st.get("segment") == "member"
+        visit_day = st.get("visit_day")
+        visit_hour = st.get("visit_hour")
     maps_url = "https://yandex.ru/maps/?text=" + _url_quote(f"Москва, {CLUB}")
     hi = f"Подтверждаю, {name}" if name else "Подтверждаю"
     if is_member:
@@ -969,7 +1051,12 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who):
     # send_to_1c/push_1c_followup, менеджер сам заводит себе задачу по
     # этому сообщению, как и раньше).
     if not is_member:
-        active = active_manager_name()
+        # Просьба Ольги 29.09: задача на визит должна называть того, кто
+        # работает в день/час САМОГО визита, а не того, кто активен сейчас
+        # (координатор мог нажать «подтвердить» на следующий день после
+        # записи). Известен день/час визита (кнопки, не «своё время»
+        # текстом) — считаем по графику визита; иначе откат на «сейчас».
+        active = manager_for_visit(visit_day, visit_hour) or active_manager_name()
         kind = "Тренировка с тренером" if fmt == "training" else "Экскурсия"
         who_line = f"Менеджер {active}" if active else "Дежурный менеджер"
         send_to_orders(subject_chat_id=target_chat_id, parse_mode="HTML",
@@ -2605,7 +2692,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-29-v35-olga-live-test-mode"
+VERSION = "2026-09-29-v36-manager-for-visit-time"
 
 
 @app.route("/health")
