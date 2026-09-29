@@ -644,19 +644,61 @@ def send_coordinator_summary():
     api("sendMessage", chat_id=coord_id, parse_mode="HTML", text="\n".join(lines))
 
 
-_DAILY_MARKS = {"evening_prompt": None, "morning_nag": None, "coord_summary": None}
+BOT_STATE_PATH = "data/bot_scheduler_state.json"
+_DAILY_MARKS = {"evening_prompt": None, "morning_nag": None, "coord_summary": None,
+                "followup_24h_hour": None, "op_schedule_refresh": None}
 
 
 def _load_daily_marks():
-    sent = (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}).get("_sent", {})
+    sent = gh_read_json(BOT_STATE_PATH, default={}) or {}
     for k in _DAILY_MARKS:
         _DAILY_MARKS[k] = sent.get(k)
 
 
-def _mark_daily_sent(key, today):
-    _DAILY_MARKS[key] = today
-    gh_update_json(TRAINER_SLOTS_PATH, lambda d: d.setdefault("_sent", {}).__setitem__(key, today),
-                   f"daily-mark {key} {today}")
+def _mark_daily_sent(key, value):
+    _DAILY_MARKS[key] = value
+    gh_update_json(BOT_STATE_PATH, lambda d: d.__setitem__(key, value), f"daily-mark {key} {value}")
+
+
+def send_24h_followups():
+    """Раньше — followup_24h.yml (sandow-lp, cron раз в час). Перенесено
+    внутрь бота 30.09.2026 по просьбе Ольги: работа не должна зависеть от
+    GitHub Actions вообще (у schedule-триггера доказанные многочасовые
+    пропуски, см. ЗАДАЧИ-ХВОСТ.md) — бот и так живёт непрерывно (self-ping).
+    Логика 1:1 с прежним workflow, включая безопасную от гонки запись
+    флага (тот же gh_update_json, что и у окон тренеров)."""
+    now = datetime.now(MSK)
+    data = gh_read_json(GH_PATH, default={}) or {}
+    to_process = []
+    for chat_id, rec in data.items():
+        if rec.get("segment") != "new" or rec.get("phone") or rec.get("followed_up_24h"):
+            continue
+        first_seen = rec.get("first_seen")
+        if not first_seen:
+            continue
+        try:
+            seen_at = datetime.strptime(first_seen, "%Y-%m-%d %H:%M").replace(tzinfo=MSK)
+        except ValueError:
+            continue
+        if (now - seen_at).total_seconds() / 3600 < 24:
+            continue
+        to_process.append((chat_id, rec.get("name") or rec.get("call_name") or ""))
+
+    if not to_process:
+        return
+    sent_ids = []
+    for chat_id, name in to_process:
+        hi = f"{name}, возвращаюсь к вам." if name else "Возвращаюсь к вам."
+        text = (f"{hi} Самый простой шаг — посмотреть клуб вживую: "
+                "20 минут, ни к чему не обязывает. Подобрать время?")
+        r = api("sendMessage", chat_id=int(chat_id), text=text,
+                reply_markup=kb([[("Подобрать время", "go")]]))
+        if r.get("ok"):
+            sent_ids.append(chat_id)
+    if sent_ids:
+        gh_update_json(GH_PATH,
+            lambda d, ids=sent_ids: [d[i].__setitem__("followed_up_24h", True) for i in ids if i in d],
+            f"tg-бот: догоняющее 24ч — {len(sent_ids)}")
 
 
 def _daily_scheduler_loop():
@@ -664,13 +706,20 @@ def _daily_scheduler_loop():
     29.09, реально пропускает срабатывания часами (см. ЗАДАЧИ-ХВОСТ.md).
     Бот и так живёт непрерывно (self-ping), поэтому надёжнее держать
     время внутри самого процесса. Опрос раз в 5 минут достаточен: час
-    попадания в окно (21:00 или 9:00) не пропустить."""
+    попадания в окно (21:00 или 9:00) не пропустить, час — для почасовой
+    догонялки."""
     time.sleep(30)  # дать процессу подняться, прежде чем читать GH
     _load_daily_marks()
+    refresh_op_schedule()  # сразу при старте, не ждать первые 20 минут
+    last_op_schedule_refresh = time.time()
     while True:
         try:
+            if time.time() - last_op_schedule_refresh > 1200:
+                refresh_op_schedule()
+                last_op_schedule_refresh = time.time()
             now = datetime.now(MSK)
             today = now.strftime("%Y-%m-%d")
+            hour_key = now.strftime("%Y-%m-%d-%H")
             if now.hour == 21 and _DAILY_MARKS["evening_prompt"] != today:
                 send_evening_slot_prompt()
                 _mark_daily_sent("evening_prompt", today)
@@ -680,6 +729,9 @@ def _daily_scheduler_loop():
             if now.hour == 9 and now.minute >= 30 and _DAILY_MARKS["coord_summary"] != today:
                 send_coordinator_summary()
                 _mark_daily_sent("coord_summary", today)
+            if _DAILY_MARKS["followup_24h_hour"] != hour_key:
+                send_24h_followups()
+                _mark_daily_sent("followup_24h_hour", hour_key)
         except Exception as exc:
             print(f"[daily-scheduler] {exc}", flush=True)
         time.sleep(300)
@@ -689,18 +741,13 @@ _ACTIVE_MGR = {"data": None, "ts": 0}
 
 
 def _active_mgr_data():
-    """Кэшированное (5 минут) содержимое data/op_active_manager.json —
-    считает workflow «График ОП» в sandow-lp раз в 20 минут, сам бот
-    с Google Таблицей не работает. Общий кэш для active_manager_name()
-    (кто активен сейчас) и manager_for_visit() (кто будет активен в
-    конкретный день/час визита) — незачем дважды ходить в GitHub за
-    одним и тем же файлом."""
-    if time.time() - _ACTIVE_MGR["ts"] < 300 and _ACTIVE_MGR["data"] is not None:
-        return _ACTIVE_MGR["data"]
-    data = gh_read_json("data/op_active_manager.json", default={}) or {}
-    _ACTIVE_MGR["data"] = data
-    _ACTIVE_MGR["ts"] = time.time()
-    return data
+    """Расчёт графика ОП. До 30.09.2026 читалось из data/op_active_manager.json,
+    который раз в 20 минут писал отдельный workflow op_schedule_sync.yml
+    (sandow-lp) — просьба Ольги 30.09: работа бота не должна зависеть от
+    GitHub Actions вовсе. Теперь бот качает и считает Google Таблицу сам
+    (refresh_op_schedule, внутренний таймер), держит результат в памяти —
+    читать из GitHub для этого больше не нужно, точкой отказа меньше."""
+    return _ACTIVE_MGR["data"] or {}
 
 
 def active_manager_name():
@@ -788,6 +835,88 @@ def manager_for_visit(target_day, target_hour):
     if not day:
         return None
     return _rotate_manager(day, target_hour)
+
+
+GOOGLE_SHEETS_SA_KEY = os.environ.get("GOOGLE_SHEETS_SA_KEY", "")
+OP_SCHEDULE_SHEET_ID = "1B0PuXN-YuE1MFV5A95B8QtCT3dobipq7"
+OP_SCHEDULE_SHEET_NAME = "График ОП"
+
+
+def refresh_op_schedule():
+    """Раньше — op_schedule_sync.yml (sandow-lp), отдельный workflow раз в
+    20 минут. Перенесено внутрь бота 30.09.2026 по прямой просьбе Ольги:
+    работа не должна зависеть от GitHub Actions вовсе — у schedule-триггера
+    доказанные (29.09) многочасовые пропуски срабатываний. Бот качает и
+    считает Google Таблицу сам через внутренний таймер (_daily_scheduler_loop),
+    результат держит в памяти (_ACTIVE_MGR) — читать из GitHub для этого
+    больше не нужно. Доступ — тот же служебный аккаунт Google, расшарен
+    лично на адрес, не по публичной ссылке (решение Ольги 28.09: в таблице
+    личные рабочие часы менеджеров)."""
+    if not GOOGLE_SHEETS_SA_KEY:
+        print("[op-schedule] GOOGLE_SHEETS_SA_KEY не задан — расчёт выключен", flush=True)
+        return
+    try:
+        import io as _io
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseDownload
+        from openpyxl import load_workbook
+
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(GOOGLE_SHEETS_SA_KEY),
+            scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        drive = build("drive", "v3", credentials=creds)
+        buf = _io.BytesIO()
+        dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=OP_SCHEDULE_SHEET_ID))
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+
+        wb = load_workbook(_io.BytesIO(buf.getvalue()), data_only=True)
+        ws = wb[OP_SCHEDULE_SHEET_NAME]
+
+        managers = []
+        col = 3
+        while col <= ws.max_column:
+            nm = ws.cell(row=1, column=col).value
+            if not nm:
+                break
+            managers.append((nm, col))
+            col += 2
+
+        schedule = {}
+        for row in range(3, ws.max_row + 1):
+            day = ws.cell(row=row, column=1).value
+            if not isinstance(day, (int, float)):
+                continue
+            day_managers = {}
+            for nm, c in managers:
+                status = str(ws.cell(row=row, column=c).value or "").strip()
+                hours = str(ws.cell(row=row, column=c + 1).value or "").strip()
+                day_managers[nm] = [status, hours]
+            schedule[str(int(day))] = day_managers
+
+        now = datetime.now(MSK)
+        today_rec = schedule.get(str(now.day), {})
+        active = _rotate_manager(today_rec, now.hour)
+        working_today = [nm for nm, (status, hours) in today_rec.items()
+                          if status.lower().startswith("раб") and _SHIFT_HOURS_RE.match(hours.strip())]
+
+        result = {
+            "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M"),
+            "active_manager": active, "working_today": working_today,
+            "computed_at": now.isoformat(), "schedule": schedule,
+        }
+        _ACTIVE_MGR["data"] = result
+        _ACTIVE_MGR["ts"] = time.time()
+        # Запись в GitHub — только для наглядности (посмотреть текущий расчёт
+        # снаружи), сам бот её больше не читает. Провалится — не страшно,
+        # активный менеджер всё равно посчитан и лежит в памяти.
+        gh_write_json("data/op_active_manager.json", result,
+                      f"график ОП: активный {active or '—'} ({now.strftime('%H:%M')})")
+        print(f"[op-schedule] обновлено, активный менеджер: {active or '—'}", flush=True)
+    except Exception as exc:
+        print(f"[op-schedule] ошибка: {exc}", flush=True)
 
 
 def save_subscriber(user, segment=None, phone=None, call_name=None, source=None):
@@ -3128,7 +3257,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-29-v39-trainer-pick-on-confirm"
+VERSION = "2026-09-30-v40-no-github-actions-dependency"
 
 
 @app.route("/health")
