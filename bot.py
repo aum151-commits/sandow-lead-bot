@@ -541,6 +541,29 @@ def _trainer_day_rec(data, date, name):
             or {"free": [], "day_off": False, "booked": {}})
 
 
+def _free_trainers_for(date, slot):
+    """Тренеры, у которых этот слот в этот день отмечен свободным и ещё
+    не занят гостем — для выбора координатором при подтверждении записи
+    (раздел 11 сценария, правка Ольги 29.09)."""
+    if not date or not slot:
+        return []
+    days = (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}).get("days", {})
+    day = days.get(date, {})
+    return [nm for nm, rec in day.items()
+            if not rec.get("day_off") and slot in rec.get("free", [])
+            and slot not in rec.get("booked", {})]
+
+
+def trainer_chat_id_for(name):
+    """chat_id зарегистрированного тренера по имени — чтобы прислать ему
+    карточку гостя. None, если ещё не регистрировался."""
+    data = gh_read_json(TRAINER_GH_PATH, default={}) or {}
+    for cid, rec in data.items():
+        if rec.get("name") == name:
+            return int(cid)
+    return None
+
+
 def render_trainer_slot_kb(date, name):
     data = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
     rec = _trainer_day_rec(data, date, name)
@@ -709,6 +732,19 @@ def resolve_visit_day(period, msk_now=None):
     if target.month != now.month or target.year != now.year:
         return None
     return target.day
+
+
+def resolve_visit_date(period, msk_now=None):
+    """То же самое, что resolve_visit_day, но полной датой ГГГГ-ММ-ДД —
+    формат, которым ключуется data/trainer_slots.json (не ограничен одним
+    месяцем, в отличие от графика ОП, поэтому проверка на смену месяца
+    здесь не нужна)."""
+    idx = _WEEKDAY_INDEX.get(period)
+    if idx is None:
+        return None
+    now = msk_now or datetime.now(MSK)
+    days_ahead = (idx - now.weekday()) % 7
+    return (now.date() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
 
 def _rotate_manager(day_managers, hour):
@@ -1120,30 +1156,52 @@ def finalize_booking(chat_id, message_id, user, st):
     ]
     if health:
         lines.append(f"<b>Особенности здоровья:</b> {health}")
-    # Тренировку с тренером назначает координатор зала — упоминаем её по
-    # нику прямо в карточке (решение Ольги 28.09: проще прямого упоминания
-    # в группе, чем городить отдельную личную рассылку через бота).
-    if fmt == "training":
-        lines.append(f"\n{COORDINATOR_TG} — подтвердите время клиенту одним нажатием:")
+
+    # Раздел 11 сценария (правка Ольги 29.09): если на это время есть
+    # свободные тренеры по календарю окон — координатор выбирает конкретного
+    # тренера одним нажатием, видя картину, а не подтверждает вслепую.
+    # Данных нет (тренер не отметился, «своё время» текстом) — старое
+    # поведение, слепая кнопка «Подтвердить», координатор разбирается сама.
+    visit_date, visit_slot = st.get("visit_date"), st.get("visit_slot")
+    candidates = _free_trainers_for(visit_date, visit_slot) if fmt == "training" else []
+    if candidates:
+        tail = f"\nСвободны на {time_pref} — выберите тренера:"
+        group_tail = dm_tail = tail
+        markup = kb([[(nm, f"at:{chat_id}:{_TRAINERS.index(nm)}")]
+                      for nm in candidates if nm in _TRAINERS])
+    elif fmt == "training":
+        # Тренировку с тренером назначает координатор зала — упоминаем её по
+        # нику прямо в карточке (решение Ольги 28.09: проще прямого упоминания
+        # в группе, чем городить отдельную личную рассылку через бота).
+        group_tail = f"\n{COORDINATOR_TG} — подтвердите время клиенту одним нажатием:"
+        dm_tail = "\nПодтвердите время клиенту одним нажатием:"
+        markup = kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]])
     else:
         active = active_manager_name()
         who = f"{active} — вы активный менеджер сейчас, подтвердите" if active else "Менеджер — подтвердите"
-        lines.append(f"\n{who} время клиенту одним нажатием:")
-    r = send_to_orders(subject_chat_id=chat_id, parse_mode="HTML", text="\n".join(lines),
-                        reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
+        group_tail = dm_tail = f"\n{who} время клиенту одним нажатием:"
+        markup = kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]])
+
+    r = send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
+                        text="\n".join(lines) + group_tail, reply_markup=markup)
     booking_mid = (r.get("result") or {}).get("message_id")
     if fmt == "training" and not is_live_test(chat_id):
         coord_id = coordinator_chat_id()
         if coord_id:
             api("sendMessage", chat_id=coord_id, parse_mode="HTML",
-                text="\n".join(lines[:-1]) + "\n\nПодтвердите время клиенту одним нажатием:",
-                reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
+                text="\n".join(lines) + dm_tail, reply_markup=markup)
 
     with LOCK:
         STATE[chat_id] = {
             "segment": "new", "dir": direction, "fmt": fmt, "phone": phone,
             "time_pref": time_pref, "health": health,
             "booking_mid": booking_mid, "client_name": who_client,
+            # Баг найден 29.09: раньше этот словарь целиком перезаписывался
+            # и стирал visit_day/visit_hour, которые slot_chosen только что
+            # сохранил — manager_for_visit из-за этого фактически не работал
+            # с момента добавления. Теперь переносим явно.
+            "visit_day": st.get("visit_day"), "visit_hour": st.get("visit_hour"),
+            "visit_date": st.get("visit_date"), "visit_slot": st.get("visit_slot"),
         }
     extra = (f"Формат: {kind}. Время: {time_pref}."
              + (f" Особенности здоровья: {health}." if health else ""))
@@ -1175,20 +1233,33 @@ def finalize_member_training(chat_id, message_id, user, st):
     label = "уже занимается с экспертом" if already else "НИКОГДА не занимался — вводная ПТ в подарок"
     card = (f"🏋️ <b>ЗАПИСЬ НА ТРЕНИРОВКУ (член клуба)</b>\n{member_card_line(user)}\n"
             f"Статус: {label}.\n<b>Желаемое время:</b> {time_pref}.")
+
+    visit_date, visit_slot = st.get("visit_date"), st.get("visit_slot")
+    candidates = _free_trainers_for(visit_date, visit_slot)
+    if candidates:
+        tail = f"\n\nСвободны на {time_pref} — выберите тренера:"
+        group_tail = dm_tail = tail
+        markup = kb([[(nm, f"at:{chat_id}:{_TRAINERS.index(nm)}")]
+                      for nm in candidates if nm in _TRAINERS])
+    else:
+        group_tail = f"\n\n{COORDINATOR_TG} — подтвердите время клиенту одним нажатием:"
+        dm_tail = "\n\nПодтвердите время клиенту одним нажатием:"
+        markup = kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]])
+
     r = send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
-        text=f"{card}\n\n{COORDINATOR_TG} — подтвердите время клиенту одним нажатием:",
-        reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
+        text=f"{card}{group_tail}", reply_markup=markup)
     booking_mid = (r.get("result") or {}).get("message_id")
     if not is_live_test(chat_id):
         coord_id = coordinator_chat_id()
         if coord_id:
             api("sendMessage", chat_id=coord_id, parse_mode="HTML",
-                text=f"{card}\n\nПодтвердите время клиенту одним нажатием:",
-                reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
+                text=f"{card}{dm_tail}", reply_markup=markup)
     with LOCK:
         STATE[chat_id] = {
             "segment": "member", "fmt": "training", "time_pref": time_pref,
             "booking_mid": booking_mid, "client_name": who_client,
+            "visit_day": st.get("visit_day"), "visit_hour": st.get("visit_hour"),
+            "visit_date": st.get("visit_date"), "visit_slot": st.get("visit_slot"),
         }
 
 
@@ -1209,6 +1280,8 @@ def slot_chosen(chat_id, message_id, user, fmt, period, hhmm):
         # клика «подтвердить» (manager_for_visit в coordinator_confirm).
         st["visit_day"] = resolve_visit_day(period)
         st["visit_hour"] = int(hhmm.split(":")[0])
+        st["visit_date"] = resolve_visit_date(period)
+        st["visit_slot"] = hhmm
         member_flow = "member_training_already" in st
         snapshot = dict(st)
     if member_flow:
@@ -1216,41 +1289,85 @@ def slot_chosen(chat_id, message_id, user, fmt, period, hhmm):
     finalize_booking(chat_id, message_id, user, snapshot)
 
 
-def coordinator_confirm(group_chat_id, message_id, target_chat_id, who):
-    """Координатор/менеджер нажал «Подтвердить время» в группе — клиенту
-    уходит финальное подтверждение (раздел 2.5), адрес — ссылкой на карту
-    (геометки и фото входа на старте нет: нет готового файла и координат —
-    честно заменено ссылкой, не выдумано)."""
+def coordinator_confirm(group_chat_id, message_id, target_chat_id, who, trainer_name=None):
+    """Координатор/менеджер нажал «Подтвердить время» (или выбрал конкретного
+    тренера, раздел 11) в группе — клиенту уходит финальное подтверждение
+    (раздел 2.5), адрес — ссылкой на карту (геометки и фото входа на старте
+    нет: нет готового файла и координат — честно заменено ссылкой, не
+    выдумано). trainer_name задан — координатор выбрала тренера из списка
+    свободных; не задан — старое поведение (слепая кнопка, координатор
+    разбирается сама, кто из тренеров свободен)."""
     with LOCK:
         st = STATE.get(target_chat_id, {})
         fmt = st.get("fmt", "training")
         time_pref = st.get("time_pref", "")
         name = st.get("client_name", "")
         phone = st.get("phone", "")
+        health = st.get("health", "")
         direction = st.get("dir", "any")
         is_member = st.get("segment") == "member"
         visit_day = st.get("visit_day")
         visit_hour = st.get("visit_hour")
+        visit_date = st.get("visit_date")
+        visit_slot = st.get("visit_slot")
     maps_url = "https://yandex.ru/maps/?text=" + _url_quote(f"Москва, {CLUB}")
     hi = f"Подтверждаю, {name}" if name else "Подтверждаю"
     if is_member:
         # Действующий член клуба — у неё уже есть браслет и доступ, паспорт
         # и адрес не нужны (это только для гостя, правка 28.09).
-        text = (f"{hi}: {time_pref}. Фитнес-эксперт уже знает о встрече, "
+        expert_line = trainer_name if trainer_name else "Фитнес-эксперт"
+        text = (f"{hi}: {time_pref}. {expert_line} уже знает о встрече, "
                 "ждём вас! До скорой связи!")
     elif fmt == "training":
+        # Имя тренера — приложением через тире, чтобы не зависеть от
+        # склонения («с Дарья Салихова» грамматически неверно, а «с
+        # фитнес-экспертом — это будет Дарья Салихова» верно при любом имени).
+        expert_line = (f"Вас встретит менеджер и познакомит с фитнес-экспертом"
+                        + (f" — это будет {trainer_name}" if trainer_name else "") + ". Накануне напомню!")
         text = (f"{hi}: {time_pref}. Возьмите спортивную форму, кроссовки и "
                 f"паспорт — он нужен для оформления гостевого визита.\n"
                 f"Адрес: Москва, {CLUB}. Маршрут: {maps_url}\n"
-                "Вас встретит менеджер и познакомит с фитнес-экспертом. Накануне напомню!")
+                f"{expert_line}")
     else:
         text = (f"{hi}: {time_pref}. Возьмите с собой паспорт — он нужен для "
                 f"оформления визита.\nАдрес: Москва, {CLUB}. Маршрут: {maps_url}\n"
                 "Вас встретит менеджер. Накануне напомню. До встречи!")
+    # Раздел 11 (правка 29.09): выбранный тренер — закрываем его слот в
+    # календаре окон гостем и шлём ему карточку клиента с кнопками статуса
+    # ДО сообщения клиенту «{тренер} уже знает о встрече» — иначе клиент
+    # узнаёт об этом раньше самого тренера (замечание content-compliance-
+    # critic 29.09, доли секунды разницы, но раз дёшево починить — чиним).
+    # is_live_test — иначе живой тест Ольги реально забронирует слот
+    # настоящего тренера и пришлёт ему карточку выдуманного гостя (та же
+    # защита, что и для рабочей группы/координатора/1С, v35).
+    if trainer_name and visit_date and visit_slot and not is_live_test(target_chat_id):
+        guest = name or "без имени"
+
+        def _book(d, date=visit_date, slot=visit_slot, tname=trainer_name, guest=guest):
+            day = d.setdefault("days", {}).setdefault(date, {})
+            rec = day.setdefault(tname, {"free": [], "day_off": False, "booked": {}})
+            if slot in rec.get("free", []):
+                rec["free"].remove(slot)
+            rec.setdefault("booked", {})[slot] = guest
+        gh_update_json(TRAINER_SLOTS_PATH, _book, f"{trainer_name}: гость {guest} {visit_date} {visit_slot}")
+
+        t_chat = trainer_chat_id_for(trainer_name)
+        if t_chat:
+            card = [f"🏋️ <b>Новый гость — {time_pref}</b>", f"<b>Имя:</b> {guest}"]
+            if phone:
+                card.append(f"<b>Телефон:</b> <code>{phone}</code>")
+            if health:
+                card.append(f"<b>Особенности здоровья:</b> {health}")
+            card.append("\nПосле контакта с гостем отметьте статус:")
+            api("sendMessage", chat_id=t_chat, parse_mode="HTML", text="\n".join(card),
+                reply_markup=kb([[("Связался, подтвердил", f"tstatus:{target_chat_id}:ok"),
+                                   ("Перенёс", f"tstatus:{target_chat_id}:moved")]]))
+
     api("sendMessage", chat_id=target_chat_id, text=text)
     who_name = who.get("first_name", "менеджер")
+    confirmed_label = f"✅ Подтверждено: {who_name}" + (f" → {trainer_name}" if trainer_name else "")
     api("editMessageReplyMarkup", chat_id=group_chat_id, message_id=message_id,
-        reply_markup=kb([[(f"✅ Подтверждено: {who_name}", "noop")]]))
+        reply_markup=kb([[(confirmed_label, "noop")]]))
 
     # Правка Ольги 28.09: после подтверждения — явная задача дежурному
     # менеджеру в чат заявок (не в 1С — там задачи ставить нельзя, API
@@ -1266,9 +1383,12 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who):
         active = manager_for_visit(visit_day, visit_hour) or active_manager_name()
         kind = "Тренировка с тренером" if fmt == "training" else "Экскурсия"
         who_line = f"Менеджер {active}" if active else "Дежурный менеджер"
+        # Видимость для менеджера ОП (раздел 11, добавлено Ольгой 27.09):
+        # имя назначенного фитнес-эксперта — в каждом уведомлении.
+        expert_note = f"\n<b>Тренер:</b> {trainer_name}" if trainer_name else ""
         send_to_orders(subject_chat_id=target_chat_id, parse_mode="HTML",
             text=(f"📋 <b>ЗАДАЧА: {kind.upper()} НАЗНАЧЕНА</b>\n"
-                  f"{who_line} — {time_pref}.\n"
+                  f"{who_line} — {time_pref}.{expert_note}\n"
                   f"<b>Клиент:</b> {name or 'без имени'}"
                   + (f" · <code>{phone}</code>" if phone else "") + "\n"
                   f"<b>Направление:</b> {DIRS.get(direction, DIRS['any'])[0]}\n"
@@ -2471,6 +2591,23 @@ def on_button(cq):
         target = int(data.split(":", 1)[1])
         return coordinator_confirm(chat_id, mid, target, user)
 
+    if data.startswith("at:"):
+        _, target_s, idx_s = data.split(":", 2)
+        target, idx = int(target_s), int(idx_s)
+        if not (0 <= idx < len(_TRAINERS)):
+            return
+        return coordinator_confirm(chat_id, mid, target, user, trainer_name=_TRAINERS[idx])
+
+    if data.startswith("tstatus:"):
+        _, target_s, status = data.split(":", 2)
+        target = int(target_s)
+        trainer_name = trainer_name_for(chat_id) or "Тренер"
+        label = {"ok": "связался(-лась), подтвердил(а) гостю время",
+                  "moved": "перенёс(ла) встречу — уточните новое время"}.get(status, status)
+        send_to_orders(subject_chat_id=target, parse_mode="HTML",
+            text=f"👤 <b>{trainer_name}</b>: {label} (#id{target})")
+        return api("editMessageReplyMarkup", chat_id=chat_id, message_id=mid, reply_markup=kb([]))
+
     if data.startswith("ack:"):
         with LOCK:
             STATE[data] = True
@@ -2991,7 +3128,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-29-v38-trainer-slots-calendar"
+VERSION = "2026-09-29-v39-trainer-pick-on-confirm"
 
 
 @app.route("/health")
