@@ -236,6 +236,17 @@ LANDINGS = {
 
 FALLBACK_CHAT = os.environ.get("FALLBACK_CHAT_ID", "220285486").strip()
 
+# Просьба Ольги 29.09.2026: живой тестовый прогон бота на предмет расхождений
+# со схемой — рабочую группу, координатора и 1С трогать нельзя, только её
+# личный чат. Тот же аккаунт, что и FALLBACK_CHAT (в приватном чате с ботом
+# chat_id совпадает с Telegram id пользователя), поэтому её собственный
+# разговор с ботом опознаётся сам, без отдельного переключателя «режим теста».
+OLGA_TEST_ID = FALLBACK_CHAT
+
+
+def is_live_test(chat_id):
+    return bool(OLGA_TEST_ID) and str(chat_id) == str(OLGA_TEST_ID)
+
 
 def api(method, **payload):
     try:
@@ -249,13 +260,22 @@ def api(method, **payload):
         return {}
 
 
-def send_to_orders(**payload):
+def send_to_orders(subject_chat_id=None, **payload):
     """Отправка в рабочую группу с запасным выходом.
 
     14.08 бот оказался удалён из группы заявок, и заявка ушла в никуда —
     молча. Теперь при недоступной группе сообщение падает в личный чат
     Ольги с пометкой тревоги: потерять заявку тихо больше нельзя.
+
+    subject_chat_id — чат клиента, о котором это сообщение (не обязателен
+    для системных уведомлений). Если это её собственный тестовый разговор
+    (is_live_test), сообщение уходит ей же с пометкой «ТЕСТ», а не в
+    рабочую группу — просьба Ольги 29.09.2026 не беспокоить никого во
+    время живой проверки бота.
     """
+    if is_live_test(subject_chat_id):
+        payload["text"] = "🧪 ТЕСТ (в рабочую группу не отправлено):\n\n" + payload.get("text", "")
+        return api("sendMessage", chat_id=subject_chat_id, **payload)
     r = api("sendMessage", chat_id=ORDERS_CHAT, **payload)
     if r.get("ok"):
         return r
@@ -699,7 +719,7 @@ def schedule_dropoff_watch(chat_id, delay=900):
             else "\n15 минут не отвечает боту дальше — похоже, отвлёкся. Перезвоните."
 
         def _send():
-            send_to_orders(parse_mode="HTML",
+            send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
                 text=(f"📵 <b>ОСТАВИЛ НОМЕР, ЗАПИСЬ НЕ ЗАВЕРШИЛ</b>\n"
                       f"<b>Имя:</b> {name or 'без имени'}\n"
                       f"<b>Телефон:</b> <code>{phone}</code>\n"
@@ -828,10 +848,10 @@ def finalize_booking(chat_id, message_id, user, st):
         active = active_manager_name()
         who = f"{active} — вы активный менеджер сейчас, подтвердите" if active else "Менеджер — подтвердите"
         lines.append(f"\n{who} время клиенту одним нажатием:")
-    r = send_to_orders(parse_mode="HTML", text="\n".join(lines),
+    r = send_to_orders(subject_chat_id=chat_id, parse_mode="HTML", text="\n".join(lines),
                         reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
     booking_mid = (r.get("result") or {}).get("message_id")
-    if fmt == "training":
+    if fmt == "training" and not is_live_test(chat_id):
         coord_id = coordinator_chat_id()
         if coord_id:
             api("sendMessage", chat_id=coord_id, parse_mode="HTML",
@@ -846,7 +866,8 @@ def finalize_booking(chat_id, message_id, user, st):
         }
     extra = (f"Формат: {kind}. Время: {time_pref}."
              + (f" Особенности здоровья: {health}." if health else ""))
-    push_1c_followup(phone, extra)
+    if not is_live_test(chat_id):
+        push_1c_followup(phone, extra)
 
 
 def finalize_member_training(chat_id, message_id, user, st):
@@ -873,15 +894,16 @@ def finalize_member_training(chat_id, message_id, user, st):
     label = "уже занимается с экспертом" if already else "НИКОГДА не занимался — вводная ПТ в подарок"
     card = (f"🏋️ <b>ЗАПИСЬ НА ТРЕНИРОВКУ (член клуба)</b>\n{member_card_line(user)}\n"
             f"Статус: {label}.\n<b>Желаемое время:</b> {time_pref}.")
-    r = send_to_orders(parse_mode="HTML",
+    r = send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
         text=f"{card}\n\n{COORDINATOR_TG} — подтвердите время клиенту одним нажатием:",
         reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
     booking_mid = (r.get("result") or {}).get("message_id")
-    coord_id = coordinator_chat_id()
-    if coord_id:
-        api("sendMessage", chat_id=coord_id, parse_mode="HTML",
-            text=f"{card}\n\nПодтвердите время клиенту одним нажатием:",
-            reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
+    if not is_live_test(chat_id):
+        coord_id = coordinator_chat_id()
+        if coord_id:
+            api("sendMessage", chat_id=coord_id, parse_mode="HTML",
+                text=f"{card}\n\nПодтвердите время клиенту одним нажатием:",
+                reply_markup=kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]))
     with LOCK:
         STATE[chat_id] = {
             "segment": "member", "fmt": "training", "time_pref": time_pref,
@@ -950,7 +972,7 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who):
         active = active_manager_name()
         kind = "Тренировка с тренером" if fmt == "training" else "Экскурсия"
         who_line = f"Менеджер {active}" if active else "Дежурный менеджер"
-        send_to_orders(parse_mode="HTML",
+        send_to_orders(subject_chat_id=target_chat_id, parse_mode="HTML",
             text=(f"📋 <b>ЗАДАЧА: {kind.upper()} НАЗНАЧЕНА</b>\n"
                   f"{who_line} — {time_pref}.\n"
                   f"<b>Клиент:</b> {name or 'без имени'}"
@@ -1044,7 +1066,7 @@ def bridge_on(chat_id, message_id=None, user=None):
         ack_key = f"ack:{chat_id}:{int(time.time())}"
 
         def _send_open_notice():
-            send_to_orders(parse_mode="HTML",
+            send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
                 text=(f"💬 <b>Открыл чат клуба</b> ({seg})\n"
                       f"<b>{who}</b> · {uname}{pline}\n"
                       "Переписка — в 1С, вкладка Телеграм. Кто смотрит — нажмите «Беру»."),
@@ -1058,7 +1080,7 @@ def bridge_on(chat_id, message_id=None, user=None):
 
             def _do_send():
                 mark = "⏰" if round_no == 1 else "⚠️ ВТОРОЕ НАПОМИНАНИЕ"
-                send_to_orders(parse_mode="HTML",
+                send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
                     text=(f"{mark} <b>Проверьте вкладку Телеграм в 1С</b> — "
                           f"чат открывал: <b>{w}</b>{p}"),
                     reply_markup=kb([[("✅ Беру", k)]]))
@@ -1127,7 +1149,7 @@ def archive_dialog(chat_id):
         except Exception as exc:
             print(f"[dlg-base] {exc}", flush=True)
         # дубль в 1С — только если знаем номер
-        if not (ONEC_WEBHOOK and phone):
+        if not (ONEC_WEBHOOK and phone) or is_live_test(chat_id):
             return
         try:
             kind = "член клуба" if seg == "member" else "новый клиент"
@@ -1203,7 +1225,7 @@ def bridge_to_group(chat_id, user, text, message_id=None):
     phone = lookup_phone(user.get("id"))
     pline = (f"<b>Телефон:</b> <code>{phone}</code> — продолжить диалог из 1С\n"
              if phone else "Телефон не оставлял — отвечайте реплаем здесь\n")
-    send_to_orders(parse_mode="HTML",
+    send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
         text=(f"💬 <b>СООБЩЕНИЕ ИЗ БОТА</b> ({seg})\n\n"
               f"<b>{who}</b> · {uname}\n"
               f"{pline}\n"
@@ -1257,6 +1279,8 @@ def send_to_1c(user, phone, goal, direction, source="", метки=None, fmt="")
     """
     if not ONEC_WEBHOOK:
         return ""
+    if is_live_test(user.get("id")):
+        return "\n\n🧪 ТЕСТ — в 1С не отправлено"
 
     name = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x).strip()
     fmt_line = {"training": " Формат: тренировка с тренером (в подарок).",
@@ -1320,7 +1344,7 @@ def send_lead(user, phone, goal, direction, source="", fmt=""):
         "клиент ответит."
     )
     text += send_to_1c(user, phone, goal, direction, source, fmt=fmt)
-    r = send_to_orders(text=text, parse_mode="HTML",
+    r = send_to_orders(subject_chat_id=user.get("id"), text=text, parse_mode="HTML",
                         reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
     log_lead_event(user.get("id"), "lead_created", phone=phone)
     return (r.get("result") or {}).get("message_id")
@@ -2003,7 +2027,7 @@ def on_button(cq):
                         "Отправляя фото, вы соглашаетесь на обработку персональных данных.")
 
     if data == "member_term":
-        send_to_orders(parse_mode="HTML",
+        send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
             text=f"📆 <b>СПРОСИЛ СРОК АБОНЕМЕНТА</b>\n{member_card_line(user)}\n"
                  "Ответьте клиенту реплаем на это сообщение — уйдёт ему в бот.\n"
                  f"#id{chat_id}")
@@ -2128,10 +2152,15 @@ def on_message(msg):
         with LOCK:
             STATE.setdefault(chat_id, {}).pop("await_tax_photo", None)
         file_id = photos[-1]["file_id"]
-        api("sendPhoto", chat_id=ORDERS_CHAT, photo=file_id, parse_mode="HTML",
-            caption=f"🧾 <b>СПРАВКА ДЛЯ ВЫЧЕТА — фото паспорта</b>\n{member_card_line(user)}\n"
-                    f"Когда справка готова, ответьте клиенту реплаем на это сообщение.\n"
-                    f"#id{chat_id}")
+        photo_caption = (f"🧾 <b>СПРАВКА ДЛЯ ВЫЧЕТА — фото паспорта</b>\n{member_card_line(user)}\n"
+                          f"Когда справка готова, ответьте клиенту реплаем на это сообщение.\n"
+                          f"#id{chat_id}")
+        if is_live_test(chat_id):
+            api("sendPhoto", chat_id=chat_id, photo=file_id, parse_mode="HTML",
+                caption="🧪 ТЕСТ (в рабочую группу не отправлено):\n\n" + photo_caption)
+        else:
+            api("sendPhoto", chat_id=ORDERS_CHAT, photo=file_id, parse_mode="HTML",
+                caption=photo_caption)
         return api("sendMessage", chat_id=chat_id,
                    text="Фото получено, передала в работу. Менеджер напишет здесь, "
                         "когда справка будет готова.")
@@ -2148,7 +2177,7 @@ def on_message(msg):
     if awaiting_freeze and text and not text.startswith("/"):
         with LOCK:
             STATE.setdefault(chat_id, {}).pop("await_freeze", None)
-        send_to_orders(parse_mode="HTML",
+        send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
             text=f"❄️ <b>ЗАПРОС ЗАМОРОЗКИ</b>\n{member_card_line(user)}\n"
                  f"Клиент указал: {text}\n"
                  "Оформите и подтвердите клиенту реплаем на это сообщение.\n"
@@ -2270,9 +2299,9 @@ def on_message(msg):
         save_subscriber(user, call_name=name)
         note = f"✏️ Клиент просит обращаться: <b>{name}</b>"
         if lead_mid:
-            send_to_orders(text=note, parse_mode="HTML", reply_to_message_id=lead_mid)
+            send_to_orders(subject_chat_id=chat_id, text=note, parse_mode="HTML", reply_to_message_id=lead_mid)
         else:
-            send_to_orders(text=note, parse_mode="HTML")
+            send_to_orders(subject_chat_id=chat_id, text=note, parse_mode="HTML")
         # сразу открываем дорогу в клубный Телеграм: пока клиент сам не написал
         # первым, номерной аккаунт 1С не может отправить ему ни слова
         # (приватность Телеграма) — 15.08 заявка Татьяны осталась без связи.
@@ -2576,7 +2605,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-29-v34-phone-step-honest"
+VERSION = "2026-09-29-v35-olga-live-test-mode"
 
 
 @app.route("/health")
