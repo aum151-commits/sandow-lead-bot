@@ -429,6 +429,42 @@ def gh_write_json(path, data, message):
         print(f"[gh] запись {path}: {exc}", flush=True)
 
 
+def gh_update_json(path, mutate, message, attempts=5):
+    """Как gh_write_json, но безопасно при гонке: перед каждой попыткой
+    перечитывает файл заново и применяет mutate(data) к свежей копии,
+    а не пишет один раз поверх снимка, снятого до этого. Нужен для файлов,
+    которые правит сразу много людей почти одновременно (окна тренеров
+    вечером, до 19 человек за несколько минут) — обычный read-once-write-once
+    ловил 409 и терял запись (инцидент 28-29.09 с followup_24h.yml)."""
+    for attempt in range(attempts):
+        try:
+            url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
+            r = requests.get(url, headers=_gh_headers(), timeout=30)
+            if r.status_code == 200:
+                payload = r.json()
+                data = json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
+                sha = payload["sha"]
+            else:
+                data, sha = {}, None
+            mutate(data)
+            body = {"message": message,
+                    "content": base64.b64encode(
+                        json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
+            if sha:
+                body["sha"] = sha
+            w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
+            if w.status_code in (200, 201):
+                return data
+            if w.status_code != 409:
+                print(f"[gh] обновление {path}: {w.status_code} {w.text[:120]}", flush=True)
+                return None
+        except Exception as exc:
+            print(f"[gh] обновление {path}: {exc}", flush=True)
+        time.sleep(1 + attempt)
+    print(f"[gh] обновление {path}: не удалось после {attempts} попыток", flush=True)
+    return None
+
+
 _COORD_CHAT = {"id": None, "ts": 0}
 
 
@@ -492,6 +528,138 @@ def step_trainer_register(chat_id, user):
         text="Привет! Выберите своё имя из списка — один раз, дальше буду "
              "узнавать вас сам:",
         reply_markup=kb(grid))
+
+
+# --------------------------------------------------- календарь окон тренеров
+
+TRAINER_SLOTS_PATH = "data/trainer_slots.json"
+SLOT_LIST = ["10:00", "12:00", "14:00", "16:00", "17:30", "19:30"]
+
+
+def _trainer_day_rec(data, date, name):
+    return (data.get("days", {}).get(date, {}).get(name)
+            or {"free": [], "day_off": False, "booked": {}})
+
+
+def render_trainer_slot_kb(date, name):
+    data = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
+    rec = _trainer_day_rec(data, date, name)
+    free = set(rec.get("free", []))
+    booked = rec.get("booked", {})
+    rows = []
+    for i in range(0, len(SLOT_LIST), 3):
+        row = []
+        for s in SLOT_LIST[i:i + 3]:
+            if s in booked:
+                row.append((f"👤 {s}", "noop"))
+            else:
+                label = ("✅ " if s in free else "") + s
+                row.append((label, f"tslot:{date}:{s}"))
+        rows.append(row)
+    off_label = "✅ Занят весь день" if rec.get("day_off") else "Занят весь день"
+    rows.append([(off_label, f"tslot_off:{date}")])
+    rows.append([("На неделю вперёд — так же все 7 дней", f"tslot_week:{date}")])
+    return rows
+
+
+def send_evening_slot_prompt():
+    """21:00 каждый день (раздел 11 сценария) — просим окна на завтра.
+    Триггер — внутренний таймер бота, не GitHub Actions schedule (он
+    ненадёжен, см. _self_ping)."""
+    tomorrow = (datetime.now(MSK) + timedelta(days=1)).strftime("%Y-%m-%d")
+    trainers = gh_read_json(TRAINER_GH_PATH, default={}) or {}
+    # уже закрыт «на неделю вперёд» (или чем-то ещё) — второй раз не спрашиваем,
+    # обещание «ежедневных сообщений не будет» должно выполняться буквально
+    already = (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}).get("days", {}).get(tomorrow, {})
+    for chat_id, rec in trainers.items():
+        name = rec.get("name")
+        if not name or name in already:
+            continue
+        api("sendMessage", chat_id=int(chat_id),
+            text=f"Отметьте свободные окна на завтра, {tomorrow}:",
+            reply_markup=kb(render_trainer_slot_kb(tomorrow, name)))
+
+
+def send_morning_trainer_reminder():
+    """9:00 — одно напоминание тем, кто ещё не отметил окна на сегодня."""
+    today = datetime.now(MSK).strftime("%Y-%m-%d")
+    trainers = gh_read_json(TRAINER_GH_PATH, default={}) or {}
+    slots = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
+    day = slots.get("days", {}).get(today, {})
+    for chat_id, rec in trainers.items():
+        name = rec.get("name")
+        if not name or name in day:
+            continue
+        api("sendMessage", chat_id=int(chat_id),
+            text=f"Не забудьте отметить окна на сегодня, {today}:",
+            reply_markup=kb(render_trainer_slot_kb(today, name)))
+
+
+def send_coordinator_summary():
+    """9:30 — координатору таблица «тренер × окна на сегодня-завтра»."""
+    coord_id = coordinator_chat_id()
+    if not coord_id:
+        return
+    now = datetime.now(MSK)
+    dates = [now.strftime("%Y-%m-%d"), (now + timedelta(days=1)).strftime("%Y-%m-%d")]
+    days = (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}).get("days", {})
+    lines = ["🗓 <b>Окна тренеров на сегодня-завтра</b>"]
+    for d in dates:
+        lines.append(f"\n<b>{d}</b>")
+        day = days.get(d, {})
+        if not day:
+            lines.append("— никто ещё не отметил")
+            continue
+        for name, rec in day.items():
+            if rec.get("day_off"):
+                lines.append(f"{name}: занят весь день")
+                continue
+            free, booked = rec.get("free", []), rec.get("booked", {})
+            parts = [f"{s} (гость {booked[s]})" if s in booked else s
+                     for s in SLOT_LIST if s in booked or s in free]
+            lines.append(f"{name}: {', '.join(parts) if parts else 'окон нет'}")
+    api("sendMessage", chat_id=coord_id, parse_mode="HTML", text="\n".join(lines))
+
+
+_DAILY_MARKS = {"evening_prompt": None, "morning_nag": None, "coord_summary": None}
+
+
+def _load_daily_marks():
+    sent = (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}).get("_sent", {})
+    for k in _DAILY_MARKS:
+        _DAILY_MARKS[k] = sent.get(k)
+
+
+def _mark_daily_sent(key, today):
+    _DAILY_MARKS[key] = today
+    gh_update_json(TRAINER_SLOTS_PATH, lambda d: d.setdefault("_sent", {}).__setitem__(key, today),
+                   f"daily-mark {key} {today}")
+
+
+def _daily_scheduler_loop():
+    """Внутренний таймер вместо GitHub Actions schedule — тот, как выяснилось
+    29.09, реально пропускает срабатывания часами (см. ЗАДАЧИ-ХВОСТ.md).
+    Бот и так живёт непрерывно (self-ping), поэтому надёжнее держать
+    время внутри самого процесса. Опрос раз в 5 минут достаточен: час
+    попадания в окно (21:00 или 9:00) не пропустить."""
+    time.sleep(30)  # дать процессу подняться, прежде чем читать GH
+    _load_daily_marks()
+    while True:
+        try:
+            now = datetime.now(MSK)
+            today = now.strftime("%Y-%m-%d")
+            if now.hour == 21 and _DAILY_MARKS["evening_prompt"] != today:
+                send_evening_slot_prompt()
+                _mark_daily_sent("evening_prompt", today)
+            if now.hour == 9 and _DAILY_MARKS["morning_nag"] != today:
+                send_morning_trainer_reminder()
+                _mark_daily_sent("morning_nag", today)
+            if now.hour == 9 and now.minute >= 30 and _DAILY_MARKS["coord_summary"] != today:
+                send_coordinator_summary()
+                _mark_daily_sent("coord_summary", today)
+        except Exception as exc:
+            print(f"[daily-scheduler] {exc}", flush=True)
+        time.sleep(300)
 
 
 _ACTIVE_MGR = {"data": None, "ts": 0}
@@ -2130,6 +2298,67 @@ def on_button(cq):
     if data == "trainer_register_again":
         return step_trainer_register(chat_id, user)
 
+    if data.startswith("tslot:"):
+        _, date, slot = data.split(":", 2)
+        name = trainer_name_for(chat_id)
+        if not name:
+            return
+
+        def _toggle(d, date=date, slot=slot, name=name):
+            day = d.setdefault("days", {}).setdefault(date, {})
+            rec = day.setdefault(name, {"free": [], "day_off": False, "booked": {}})
+            rec["day_off"] = False
+            if slot in rec.get("booked", {}):
+                return  # уже занят гостем — трогать нельзя
+            if slot in rec["free"]:
+                rec["free"].remove(slot)
+            else:
+                rec["free"].append(slot)
+        gh_update_json(TRAINER_SLOTS_PATH, _toggle, f"{name}: слот {slot} {date}")
+        return api("editMessageReplyMarkup", chat_id=chat_id, message_id=mid,
+            reply_markup=kb(render_trainer_slot_kb(date, name)))
+
+    if data.startswith("tslot_off:"):
+        date = data.split(":", 1)[1]
+        name = trainer_name_for(chat_id)
+        if not name:
+            return
+
+        def _off(d, date=date, name=name):
+            day = d.setdefault("days", {}).setdefault(date, {})
+            rec = day.setdefault(name, {"free": [], "day_off": False, "booked": {}})
+            rec["day_off"] = not rec.get("day_off", False)
+            if rec["day_off"]:
+                rec["free"] = []
+        gh_update_json(TRAINER_SLOTS_PATH, _off, f"{name}: весь день {date}")
+        return api("editMessageReplyMarkup", chat_id=chat_id, message_id=mid,
+            reply_markup=kb(render_trainer_slot_kb(date, name)))
+
+    if data.startswith("tslot_week:"):
+        date = data.split(":", 1)[1]
+        name = trainer_name_for(chat_id)
+        if not name:
+            return
+
+        def _week(d, date=date, name=name):
+            base = datetime.strptime(date, "%Y-%m-%d")
+            source = d.get("days", {}).get(date, {}).get(
+                name, {"free": [], "day_off": False})
+            for i in range(7):
+                dd = (base + timedelta(days=i)).strftime("%Y-%m-%d")
+                day = d.setdefault("days", {}).setdefault(dd, {})
+                prev = day.get(name, {})
+                day[name] = {
+                    "free": list(source.get("free", [])),
+                    "day_off": source.get("day_off", False),
+                    "booked": prev.get("booked", {}),
+                    "week_ahead": True,
+                }
+        gh_update_json(TRAINER_SLOTS_PATH, _week, f"{name}: на неделю вперёд с {date}")
+        return api("sendMessage", chat_id=chat_id,
+            text="Готово — эти окна проставлены на 7 дней вперёд. Ежедневных "
+                 "напоминаний не будет, пока не напишете иначе.")
+
     if data == "seg:new":
         with LOCK:
             STATE.setdefault(chat_id, {})["segment"] = "new"
@@ -2762,7 +2991,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-29-v37-trainer-self-register"
+VERSION = "2026-09-29-v38-trainer-slots-calendar"
 
 
 @app.route("/health")
@@ -2802,6 +3031,7 @@ def _self_ping():
 
 
 threading.Thread(target=_self_ping, daemon=True).start()
+threading.Thread(target=_daily_scheduler_loop, daemon=True).start()
 
 
 if __name__ == "__main__":
