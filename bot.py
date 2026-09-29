@@ -455,6 +455,45 @@ def coordinator_chat_id():
     return found
 
 
+TRAINER_GH_PATH = "data/trainer_subscribers.json"
+
+
+def trainer_name_for(chat_id):
+    """Имя зарегистрированного тренера по его chat_id, или None."""
+    data = gh_read_json(TRAINER_GH_PATH, default={}) or {}
+    rec = data.get(str(chat_id))
+    return rec.get("name") if rec else None
+
+
+def register_trainer(chat_id, user, name):
+    """Саморегистрация тренера — раздел 11 сценария, правка Ольги 29.09:
+    регистрируются ВСЕ тренеры, а не пилотная тройка (бесплатные ВПТ ведут
+    все). Читаем-пишем без повтора при 409 — по той же логике, что и
+    save_subscriber: коллизия маловероятна (регистрация разовая), а раз в
+    несколько лет случившийся конфликт чинится повторным нажатием кнопки."""
+    data = gh_read_json(TRAINER_GH_PATH, default={}) or {}
+    data[str(chat_id)] = {
+        "name": name,
+        "username": user.get("username", ""),
+        "registered_at": datetime.now(MSK).strftime("%Y-%m-%d %H:%M"),
+    }
+    gh_write_json(TRAINER_GH_PATH, data, f"тренер зарегистрирован: {name}")
+
+
+def step_trainer_register(chat_id, user):
+    existing = trainer_name_for(chat_id)
+    if existing:
+        return api("sendMessage", chat_id=chat_id,
+            text=f"Вы уже зарегистрированы как {existing}. Каждый вечер в 21:00 "
+                 "буду спрашивать свободные окна на завтра.")
+    buttons = [(name, f"trainer_pick:{i}") for i, name in enumerate(_TRAINERS)]
+    grid = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    api("sendMessage", chat_id=chat_id,
+        text="Привет! Выберите своё имя из списка — один раз, дальше буду "
+             "узнавать вас сам:",
+        reply_markup=kb(grid))
+
+
 _ACTIVE_MGR = {"data": None, "ts": 0}
 
 
@@ -2069,6 +2108,28 @@ def on_button(cq):
     user = cq.get("from", {})
     api("answerCallbackQuery", callback_query_id=cq["id"])
 
+    if data.startswith("trainer_pick:") or data.startswith("trainer_confirm:"):
+        idx = int(data.split(":", 1)[1])
+        if not (0 <= idx < len(_TRAINERS)):
+            return
+        name = _TRAINERS[idx]
+        if data.startswith("trainer_pick:"):
+            existing_data = gh_read_json(TRAINER_GH_PATH, default={}) or {}
+            taken_by = next((cid for cid, rec in existing_data.items()
+                              if rec.get("name") == name and cid != str(chat_id)), None)
+            if taken_by:
+                return api("editMessageText", chat_id=chat_id, message_id=mid,
+                    text=f"Имя «{name}» уже зарегистрировано другим аккаунтом. Это точно вы?",
+                    reply_markup=kb([[("Да, это я", f"trainer_confirm:{idx}"),
+                                       ("Нет, я другой", "trainer_register_again")]]))
+        register_trainer(chat_id, user, name)
+        return api("editMessageText", chat_id=chat_id, message_id=mid,
+            text=f"Готово, {name}! Каждый вечер в 21:00 буду спрашивать свободные "
+                 "окна на завтра — пара кнопок, минута в день.")
+
+    if data == "trainer_register_again":
+        return step_trainer_register(chat_id, user)
+
     if data == "seg:new":
         with LOCK:
             STATE.setdefault(chat_id, {})["segment"] = "new"
@@ -2283,6 +2344,15 @@ def on_message(msg):
         # заявку как есть и сломало разбор HTML — заявка не дошла бы
         # ни в группу, ни в личку.
         src = theme if re.fullmatch(r"[a-z0-9_-]{1,32}", theme or "") else None
+
+        # Раздел 11 сценария: ссылка «t.me/sandowclub_bot?start=trainer» —
+        # её постит Ольга в общий чат тренеров. Отдельная от клиентской
+        # цепочки развилка: тренер выбирает своё имя один раз, дальше бот
+        # узнаёт его по chat_id сам (правка 29.09).
+        if src == "trainer":
+            with LOCK:
+                STATE.pop(chat_id, None)
+            return step_trainer_register(chat_id, user)
 
         # Код с печатного макета внутри клуба: человек уже член клуба,
         # развилка «Хочу в клуб / Уже занимаюсь» ему не нужна — ведём
@@ -2692,7 +2762,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-09-29-v36-manager-for-visit-time"
+VERSION = "2026-09-29-v37-trainer-self-register"
 
 
 @app.route("/health")
