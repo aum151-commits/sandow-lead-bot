@@ -3322,7 +3322,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-02-v43-member-slots-7-22"
+VERSION = "2026-10-03-v44-locker-rental-in-member-menu"
 
 
 @app.route("/health")
