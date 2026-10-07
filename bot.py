@@ -535,7 +535,9 @@ def step_trainer_register(chat_id, user):
     if existing:
         return api("sendMessage", chat_id=chat_id,
             text=f"Вы уже зарегистрированы как {existing}. Каждый вечер в 21:00 "
-                 "буду спрашивать свободные окна на завтра.")
+                 "присылаю ваши окна на завтра — поправить можно и завтра, "
+                 "и любой день недели.",
+            reply_markup=kb([[("🗓 Мои окна на неделю", "tcal")]]))
     buttons = [(name, f"trainer_pick:{i}") for i, name in enumerate(_TRAINERS)]
     grid = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     api("sendMessage", chat_id=chat_id,
@@ -602,11 +604,48 @@ def trainer_chat_id_for(name):
     return None
 
 
-def render_trainer_slot_kb(date, name):
-    data = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
-    rec = _trainer_day_rec(data, date, name)
+def _okna_word(n):
+    """«1 окно», «3 окна», «7 окон»: сводку тренер читает глазами, кривое
+    слово в ней заметно и подрывает доверие к самой цифре."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "окно"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "окна"
+    return "окон"
+
+
+def _trainer_marked(data, iso, name):
+    return name in ((data.get("days", {}) or {}).get(iso, {}) or {})
+
+
+def trainer_day_state(data, iso, name):
+    """Короткая правда про день — ею живут и сводка на неделю, и вечерняя
+    сверка. «не отмечено» и «занят весь день» различимы намеренно: для
+    координатора это разное (первое — тренер день ещё не открыл, второе —
+    осознанно закрыл)."""
+    rec = _trainer_day_rec(data, iso, name)
+    free = [s for s in SLOT_LIST if s in rec.get("free", [])]
+    booked = rec.get("booked", {}) or {}
+    if not _trainer_marked(data, iso, name):
+        return "не отмечено", free, booked
+    if rec.get("day_off"):
+        return "занят весь день", free, booked
+    if free:
+        return f"{len(free)} {_okna_word(len(free))}: " + ", ".join(free), free, booked
+    if booked:
+        return "всё занято гостями", free, booked
+    return "окон нет", free, booked
+
+
+def render_trainer_slot_kb(iso, name, data=None):
+    """Кнопки дня тренера: часы, «занят весь день», «так же на всю неделю» и
+    возврат к сводке недели. data передаётся снаружи, когда файл уже прочитан
+    (вечернее сообщение читает его один раз на всех тренеров, а не по разу
+    на каждого)."""
+    data = data if data is not None else (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {})
+    rec = _trainer_day_rec(data, iso, name)
     free = set(rec.get("free", []))
-    booked = rec.get("booked", {})
+    booked = rec.get("booked", {}) or {}
     rows = []
     for i in range(0, len(SLOT_LIST), 3):
         row = []
@@ -615,58 +654,129 @@ def render_trainer_slot_kb(date, name):
                 row.append((f"👤 {s}", "noop"))
             else:
                 label = ("✅ " if s in free else "") + s
-                row.append((label, f"tslot:{date}:{s}"))
+                row.append((label, f"tslot:{iso}:{s}"))
         rows.append(row)
     off_label = "✅ Занят весь день" if rec.get("day_off") else "Занят весь день"
-    rows.append([(off_label, f"tslot_off:{date}")])
-    rows.append([("На неделю вперёд — так же все 7 дней", f"tslot_week:{date}")])
+    rows.append([(off_label, f"tslot_off:{iso}")])
+    rows.append([("📋 Так же на всю неделю", f"tslot_week:{iso}")])
+    rows.append([("⬅️ Вся неделя", "tcal")])
     return rows
 
 
+def trainer_day_text(name, iso, data=None, note=""):
+    """Экран одного дня: что уже отмечено, что занято гостями и как поправить."""
+    data = data if data is not None else (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {})
+    state, free, booked = trainer_day_state(data, iso, name)
+    lines = [f"🗓 <b>Ваши окна — {fmt_date_long(iso)}</b>"]
+    if note:
+        lines.append(note)
+    if state == "занят весь день":
+        lines.append("Весь день занят — окна не показываются.")
+    elif free:
+        lines.append("Свободно: " + ", ".join(free) + ".")
+    else:
+        lines.append("Пока ни одного окна не отмечено.")
+    if booked:
+        lines.append("Занято гостями: "
+                     + ", ".join(f"{s} — {who}" for s, who in sorted(booked.items())) + ".")
+    lines.append("\nНажмите час, чтобы отметить или снять. «Так же на всю неделю» "
+                 "переносит этот набор на остальные дни записи.")
+    return "\n".join(lines)
+
+
+def trainer_week_view(name, data=None, now=None):
+    """Сводка «тренер × вся неделя записи»: где сколько окон, что занято
+    гостями, какой день ещё не открыт. Правка 08.10.2026 (просьба Ольги):
+    раньше тренер видел только «завтра» и дотянуться до дальних дней не мог —
+    а клиент может записаться на всю неделю, значит окна нужны на всю неделю."""
+    data = data if data is not None else (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {})
+    lines = ["🗓 <b>Ваши окна на неделю</b>",
+             "Клиент может записаться на эти дни — отметьте, когда вы свободны. "
+             "Поправить можно в любой момент.", ""]
+    buttons = []
+    for iso in horizon_dates(now):
+        state, _, _ = trainer_day_state(data, iso, name)
+        lines.append(f"{fmt_date_rel(iso, now)} — {state}")
+        buttons.append((f"✏️ {fmt_date_short(iso)}", f"tday:{iso}"))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return "\n".join(lines), kb(rows)
+
+
+def _prune_old_days(data, now=None):
+    """Прошедшие дни в файле не нужны: он растёт вечно, а сводка собирает из
+    него мусор. Вчерашний день оставляем — на случай разбора «что было вчера»."""
+    keep_from = _iso(_today(now) - timedelta(days=1))
+    days = data.get("days", {}) or {}
+    for old in [k for k in list(days) if k < keep_from]:
+        days.pop(old, None)
+
+
 def send_evening_slot_prompt():
-    """21:00 каждый день (раздел 11 сценария) — просим окна на завтра.
+    """21:00 каждый день (раздел 11 сценария) — вечерняя сверка окон на завтра.
     Триггер — внутренний таймер бота, не GitHub Actions schedule (он
-    ненадёжен, см. _self_ping)."""
-    tomorrow = (datetime.now(MSK) + timedelta(days=1)).strftime("%Y-%m-%d")
+    ненадёжен, см. _self_ping).
+
+    Правка 08.10.2026 (просьба Ольги). Было: спрашиваем «завтра» и молчим с
+    теми, у кого на завтра запись уже стоит — в том числе проставленную
+    кнопкой «на всю неделю». Поправить окна на дальние дни было нечем, а сама
+    сетка на неделю незаметно устаревала. Стало: сообщение уходит ВСЕМ
+    зарегистрированным тренерам и всегда даёт либо подтвердить одним нажатием,
+    либо поправить — и завтра, и любой день недели."""
+    # Заодно чистим прошедшие дни — раз в сутки, в единственном месте, где
+    # файл всё равно читается целиком.
+    gh_update_json(TRAINER_SLOTS_PATH, _prune_old_days, "окна: чистка прошедших дней")
+    data = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
     trainers = gh_read_json(TRAINER_GH_PATH, default={}) or {}
-    # уже закрыт «на неделю вперёд» (или чем-то ещё) — второй раз не спрашиваем,
-    # обещание «ежедневных сообщений не будет» должно выполняться буквально
-    already = (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}).get("days", {}).get(tomorrow, {})
+    tomorrow = _iso(_today() + timedelta(days=1))
     for chat_id, rec in trainers.items():
         name = rec.get("name")
-        if not name or name in already:
+        if not name:
             continue
-        api("sendMessage", chat_id=int(chat_id),
-            text=f"Отметьте свободные окна на завтра, {tomorrow}:",
-            reply_markup=kb(render_trainer_slot_kb(tomorrow, name)))
+        state, _, _ = trainer_day_state(data, tomorrow, name)
+        if state == "не отмечено":
+            api("sendMessage", chat_id=int(chat_id), parse_mode="HTML",
+                text=f"Отметьте свободные окна на завтра, {fmt_date_short(tomorrow)}:",
+                reply_markup=kb(render_trainer_slot_kb(tomorrow, name, data)))
+            continue
+        api("sendMessage", chat_id=int(chat_id), parse_mode="HTML",
+            text=(f"🗓 <b>Завтра, {fmt_date_short(tomorrow)}</b> — {state}.\n"
+                  "Если что-то изменилось, поправьте; если всё в силе — "
+                  "подтвердите одним нажатием."),
+            reply_markup=kb([
+                [("✅ Всё в силе", f"tconfirm:{tomorrow}")],
+                [("✏️ Поправить завтра", f"tday:{tomorrow}")],
+                [("🗓 Вся неделя", "tcal")]]))
 
 
 def send_morning_trainer_reminder():
-    """9:00 — одно напоминание тем, кто ещё не отметил окна на сегодня."""
-    today = datetime.now(MSK).strftime("%Y-%m-%d")
+    """9:00 — одно напоминание тем, кто ещё не открыл окна на сегодня."""
+    data = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
     trainers = gh_read_json(TRAINER_GH_PATH, default={}) or {}
-    slots = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
-    day = slots.get("days", {}).get(today, {})
+    today = _iso(_today())
     for chat_id, rec in trainers.items():
         name = rec.get("name")
-        if not name or name in day:
+        if not name or _trainer_marked(data, today, name):
             continue
-        api("sendMessage", chat_id=int(chat_id),
-            text=f"Не забудьте отметить окна на сегодня, {today}:",
-            reply_markup=kb(render_trainer_slot_kb(today, name)))
+        api("sendMessage", chat_id=int(chat_id), parse_mode="HTML",
+            text=f"Не забудьте отметить окна на сегодня, {fmt_date_short(today)}:",
+            reply_markup=kb(render_trainer_slot_kb(today, name, data)))
 
 
 def send_coordinator_summary():
-    """9:30 — координатору таблица «тренер × окна на сегодня-завтра»."""
+    """9:30 — координатору окна: сегодня и завтра подробно (там записи и
+    правки), на остальные дни записи — коротко, сколько тренеров открылось.
+    Полная таблица по всем восьми дням (19 тренеров × 16 окон) читалась бы
+    как полотно, а вопрос у координатора простой: есть ли кого ставить на
+    дальний день."""
     coord_id = coordinator_chat_id()
     if not coord_id:
         return
-    now = datetime.now(MSK)
-    dates = [now.strftime("%Y-%m-%d"), (now + timedelta(days=1)).strftime("%Y-%m-%d")]
-    days = (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}).get("days", {})
-    lines = ["🗓 <b>Окна тренеров на сегодня-завтра</b>"]
-    for d in dates:
-        lines.append(f"\n<b>{d}</b>")
+    now = _now()
+    dates = horizon_dates(now)
+    days = (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}).get("days", {}) or {}
+    lines = ["🗓 <b>Окна тренеров</b>", f"Запись открыта до {fmt_date_short(dates[-1])}."]
+    for d in dates[:2]:
+        lines.append(f"\n<b>{fmt_date_rel(d, now)}</b>")
         day = days.get(d, {})
         if not day:
             lines.append("— никто ещё не отметил")
@@ -675,10 +785,19 @@ def send_coordinator_summary():
             if rec.get("day_off"):
                 lines.append(f"{name}: занят весь день")
                 continue
-            free, booked = rec.get("free", []), rec.get("booked", {})
+            free, booked = rec.get("free", []), rec.get("booked", {}) or {}
             parts = [f"{s} (гость {booked[s]})" if s in booked else s
                      for s in SLOT_LIST if s in booked or s in free]
-            lines.append(f"{name}: {', '.join(parts) if parts else 'окон нет'}")
+            # Галочка — тренер вечером подтвердил, что окна в силе: координатору
+            # это ответ на «можно ли на него рассчитывать завтра».
+            mark = " ✓" if rec.get("confirmed_at") else ""
+            lines.append(f"{name}: {', '.join(parts) if parts else 'окон нет'}{mark}")
+    lines.append("\n<b>Дальше на неделе</b>")
+    for d in dates[2:]:
+        day = days.get(d, {})
+        opened = [nm for nm, rec in day.items() if not rec.get("day_off")]
+        lines.append(f"{fmt_date_short(d)} — "
+                     + (f"открылись: {len(opened)}" if opened else "никто ещё не отметил"))
     api("sendMessage", chat_id=coord_id, parse_mode="HTML", text="\n".join(lines))
 
 
@@ -797,39 +916,12 @@ def active_manager_name():
     return _active_mgr_data().get("active_manager")
 
 
-_WEEKDAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 _SHIFT_HOURS_RE = re.compile(r"^(\d{1,2})-(\d{1,2})$")
 
-
-def resolve_visit_day(period, msk_now=None):
-    """period — ключ дня недели (mon..sun) из кнопок step_time. Возвращает
-    день месяца (int) ближайшего будущего (или сегодняшнего) вхождения
-    этого дня недели, или None, если он проваливается в другой месяц —
-    график месяца в op_active_manager.json содержит только текущий месяц,
-    доверять числу дня из чужого месяца нельзя (может случайно совпасть
-    с другим днём этого месяца)."""
-    idx = _WEEKDAY_INDEX.get(period)
-    if idx is None:
-        return None
-    now = msk_now or datetime.now(MSK)
-    days_ahead = (idx - now.weekday()) % 7
-    target = now.date() + timedelta(days=days_ahead)
-    if target.month != now.month or target.year != now.year:
-        return None
-    return target.day
-
-
-def resolve_visit_date(period, msk_now=None):
-    """То же самое, что resolve_visit_day, но полной датой ГГГГ-ММ-ДД —
-    формат, которым ключуется data/trainer_slots.json (не ограничен одним
-    месяцем, в отличие от графика ОП, поэтому проверка на смену месяца
-    здесь не нужна)."""
-    idx = _WEEKDAY_INDEX.get(period)
-    if idx is None:
-        return None
-    now = msk_now or datetime.now(MSK)
-    days_ahead = (idx - now.weekday()) % 7
-    return (now.date() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+# Прежние resolve_visit_day/resolve_visit_date (день недели → ближайшее
+# вхождение) УДАЛЕНЫ 08.10.2026: именно они превращали «Пн» в сегодняшний
+# понедельник. Их место заняли fmt_date_long/visit_day_of_month, которые
+# работают с настоящей ISO-датой из кнопки клиента.
 
 
 def _rotate_manager(day_managers, hour):
@@ -1231,51 +1323,184 @@ def ask_health(chat_id, name):
 
 
 # Правка Ольги 28.09 (живая проверка): «будни/выходные» слишком расплывчато —
-# нужен конкретный день недели, не диапазон. Порядок словаря = порядок кнопок.
+# нужен конкретный день недели, не диапазон. Полные имена нужны в текстах
+# («вторник, 13 октября»), короткие — в подписях кнопок.
 WEEKDAYS = {
     "mon": "понедельник", "tue": "вторник", "wed": "среда",
     "thu": "четверг", "fri": "пятница", "sat": "суббота", "sun": "воскресенье",
 }
-# Винительный падеж с предлогом — «в среду», «во вторник» — простое
-# правило «добавить у» ломается на «среда»/«суббота» (не «средуу»),
-# поэтому формы просто выписаны, без грамматических хитростей.
-WEEKDAYS_ACC = {
-    "mon": "в понедельник", "tue": "во вторник", "wed": "в среду",
-    "thu": "в четверг", "fri": "в пятницу", "sat": "в субботу", "sun": "в воскресенье",
-}
+WEEKDAYS_ORDER = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]  # индекс = weekday()
+WEEKDAYS_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+              "августа", "сентября", "октября", "ноября", "декабря"]
+
+# ── Горизонт записи и настоящие даты вместо дней недели (правка 08.10.2026) ──
+#
+# ЧТО БЫЛО НЕ ТАК. Кнопки дней назывались только днём недели («Пн»), а бот
+# разворачивал это в ближайшее вхождение этого дня: `(idx - now.weekday()) % 7`.
+# В понедельник «Пн» означало СЕГОДНЯ — и клиент, который хотел записаться на
+# следующий понедельник, попадал на день отправки сообщения. Это не ошибка
+# счёта, а ошибка самой кнопки: у неё не было даты, и «Пн» одинаково читалось
+# и как «сегодня», и как «через неделю» (жалоба Ольги 08.10.2026).
+#
+# ЧТО ТЕПЕРЬ. Клиент видит кнопки с настоящими датами («вт 13.10»), а выбранный
+# день едет дальше ISO-датой в callback_data — двусмысленности не остаётся ни в
+# боте, ни в карточке менеджеру, ни в заявке 1С. Старые кнопки из уже
+# отправленных сообщений (там день недели) не угадываются, а просто
+# перерисовываются в выбор дня — угадывание и было причиной бага.
+#
+# ГОРИЗОНТ. Записаться можно на сегодня (если на нём остались непрошедшие часы)
+# и на HORIZON_DAYS дней вперёд. Тренеры отмечают окна ровно на тот же срок:
+# иначе на дальние дни координатор не найдёт кандидатов и вместо выбора тренера
+# получит слепую кнопку «Подтвердить время».
+HORIZON_DAYS = 7
 
 
-def step_time(chat_id, fmt, message_id=None):
-    text = "Когда вам удобнее? Выберите день:"
-    markup = kb([
-        [("Пн", f"tp:mon:{fmt}"), ("Вт", f"tp:tue:{fmt}"), ("Ср", f"tp:wed:{fmt}"),
-         ("Чт", f"tp:thu:{fmt}")],
-        [("Пт", f"tp:fri:{fmt}"), ("Сб", f"tp:sat:{fmt}"), ("Вс", f"tp:sun:{fmt}")],
-    ])
-    if message_id:
-        api("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
-    else:
-        api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
+def _now(now=None):
+    """Единственное место, где берётся «сейчас»: тесты подменяют эту функцию,
+    чтобы проверять календарную логику на любой день недели."""
+    return now or datetime.now(MSK)
 
 
-def step_slots(chat_id, message_id, period, fmt):
-    """Какие часы показать. Три разных набора (Ольга 02.10.2026):
+def _today(now=None):
+    return _now(now).date()
+
+
+def _iso(d):
+    return d.strftime("%Y-%m-%d")
+
+
+def _parse_date(iso):
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+
+
+def horizon_dates(now=None):
+    """Все даты, доступные для записи: сегодня + HORIZON_DAYS вперёд.
+    Тот же список — у календаря тренера (trainer_week_view)."""
+    base = _today(now)
+    return [_iso(base + timedelta(days=i)) for i in range(HORIZON_DAYS + 1)]
+
+
+def fmt_date_short(iso):
+    """«вт 13.10» — подпись кнопки дня."""
+    d = _parse_date(iso)
+    return f"{WEEKDAYS_SHORT[d.weekday()]} {d.strftime('%d.%m')}" if d else (iso or "")
+
+
+def fmt_date_long(iso):
+    """«вторник, 13 октября» — для текстов клиенту и карточек менеджеру:
+    в заявке 1С и в задаче менеджеру день недели без даты читается как день
+    отправки сообщения — та же двусмысленность, что и в кнопках."""
+    d = _parse_date(iso)
+    if not d:
+        return iso or ""
+    return f"{WEEKDAYS[WEEKDAYS_ORDER[d.weekday()]]}, {d.day} {MONTHS_GEN[d.month - 1]}"
+
+
+def fmt_date_rel(iso, now=None):
+    """«сегодня, пн 12.10» / «завтра, вт 13.10» / «чт 15.10» — для календаря
+    тренера: ему важно видеть, какой из дней ближайший."""
+    d = _parse_date(iso)
+    if not d:
+        return iso or ""
+    delta = (d.date() - _today(now)).days
+    head = {0: "сегодня, ", 1: "завтра, "}.get(delta, "")
+    return head + fmt_date_short(iso)
+
+
+def visit_day_of_month(iso, now=None):
+    """День месяца для графика ОП. None, если дата вне текущего месяца: в
+    таблице графика лежит один месяц, и число из чужого месяца случайно
+    совпадёт с другим днём (та же проверка была в прежнем resolve_visit_day)."""
+    d = _parse_date(iso)
+    if not d:
+        return None
+    today = _today(now)
+    if d.month != today.month or d.year != today.year:
+        return None
+    return d.day
+
+
+def slots_for(fmt, chat_id=None):
+    """Какие часы показывать. Три разных набора (Ольга 02.10.2026):
     экскурсия — SLOTS_TOUR; подарочная тренировка новому гостю — SLOTS_TRAINING
     (рабочие часы 10:00–20:00); тренировка действующему члену клуба —
     SLOTS_MEMBER (07:00–22:00: у него доступ 24/7 и менеджер не нужен).
     Признак члена клуба — ключ member_training_already, он ставится нажатием
     «Записаться на тренировку» (bt:yes / bt:no) и больше нигде не появляется."""
     if fmt != "training":
-        slots = SLOTS_TOUR
-    elif "member_training_already" in (STATE.get(chat_id) or {}):
-        slots = SLOTS_MEMBER
+        return SLOTS_TOUR
+    if "member_training_already" in (STATE.get(chat_id) or {}):
+        return SLOTS_MEMBER
+    return SLOTS_TRAINING
+
+
+def hours_left_today(fmt, chat_id=None, now=None):
+    """Часы сегодняшнего дня, которые ещё не начались. Раньше бот показывал и
+    прошедшие: человек в 20:30 выбирал «10:00» и попадал на сегодняшнее утро,
+    а разбирался с этим координатор вручную."""
+    n = _now(now)
+    limit = n.hour * 60 + n.minute
+    out = []
+    for s in slots_for(fmt, chat_id):
+        h, m = s.split(":")
+        if int(h) * 60 + int(m) > limit:
+            out.append(s)
+    return out
+
+
+def slots_on(iso, fmt, chat_id=None, now=None):
+    """Часы конкретной даты: на сегодня — только непрошедшие."""
+    if iso == _iso(_today(now)):
+        return hours_left_today(fmt, chat_id, now)
+    return list(slots_for(fmt, chat_id))
+
+
+def bookable_dates(fmt, chat_id=None, now=None):
+    """Даты для кнопок клиенту: сегодня — только если на нём остались часы,
+    дальше — весь горизонт."""
+    today = _iso(_today(now))
+    return [iso for iso in horizon_dates(now)
+            if iso != today or hours_left_today(fmt, chat_id, now)]
+
+
+def step_time(chat_id, fmt, message_id=None, text=None):
+    """Выбор дня — кнопками с настоящими датами (см. HORIZON_DAYS).
+    Сегодняшний день выносим отдельной строкой: он самый частый выбор, и
+    подпись «Сегодня, чт 08.10» снимает вопрос, какой это день недели."""
+    today = _iso(_today())
+    buttons = [(f"Сегодня, {fmt_date_short(iso)}" if iso == today else fmt_date_short(iso),
+                f"tp:{iso}:{fmt}")
+               for iso in bookable_dates(fmt, chat_id)]
+    rows = []
+    if buttons and buttons[0][0].startswith("Сегодня"):
+        rows.append([buttons.pop(0)])
+    rows += [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    text = text or "Когда вам удобнее? Выберите день:"
+    markup = kb(rows)
+    if message_id:
+        api("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
     else:
-        slots = SLOTS_TRAINING
-    rows = [[(t, f"sl:{fmt}:{period}:{t}")] for t in slots]
-    rows.append([("Своё время", f"sl:{fmt}:{period}:own")])
-    label = WEEKDAYS_ACC.get(period, period)
+        api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
+
+
+def step_slots(chat_id, message_id, iso, fmt):
+    """Часы выбранного дня. iso — дата из кнопки дня; пришло что-то другое
+    (старое сообщение с днём недели, мусор) — показываем выбор дня заново."""
+    if iso not in horizon_dates():
+        return step_time(chat_id, fmt, message_id=message_id)
+    slots = slots_on(iso, fmt, chat_id)
+    if not slots:
+        return step_time(chat_id, fmt, message_id=message_id,
+                         text="На сегодня свободных часов уже не осталось — "
+                              "выберите другой день:")
+    rows = [[(t, f"sl:{fmt}:{iso}:{t}")] for t in slots]
+    rows.append([("Своё время", f"sl:{fmt}:{iso}:own")])
     api("editMessageText", chat_id=chat_id, message_id=message_id,
-        text=f"Выберите время {label}:", reply_markup=kb(rows))
+        text=f"Выберите время — {fmt_date_long(iso)}:", reply_markup=kb(rows))
 
 
 def push_1c_followup(phone, extra_comment):
@@ -1442,24 +1667,29 @@ def finalize_member_training(chat_id, message_id, user, st):
         }
 
 
-def slot_chosen(chat_id, message_id, user, fmt, period, hhmm):
+def slot_chosen(chat_id, message_id, user, fmt, iso, hhmm):
+    if iso not in horizon_dates():
+        # старое сообщение с днём недели — не угадываем дату, а спрашиваем заново
+        return step_time(chat_id, fmt, message_id=message_id)
     if hhmm == "own":
         with LOCK:
             STATE.setdefault(chat_id, {})["await_own_time"] = True
         return api("editMessageText", chat_id=chat_id, message_id=message_id,
                    text="Напишите, пожалуйста, день и время словами — это нужно, "
                         "чтобы забронировать для вас удобное окно.")
-    day_label = WEEKDAYS.get(period, period)
     with LOCK:
         st = STATE.setdefault(chat_id, {})
-        st["time_pref"] = f"{day_label}, {hhmm}"
+        # Время записываем вместе с датой: раньше здесь стояло «понедельник,
+        # 10:00», и менеджер по карточке не мог отличить сегодняшний
+        # понедельник от следующего — ровно то, на чём споткнулся клиент.
+        st["time_pref"] = f"{fmt_date_long(iso)}, {hhmm}"
         # Просьба Ольги 29.09: запоминаем день/час САМОГО ВИЗИТА, пока они
         # ещё структурированы (кнопки), чтобы задача менеджеру потом ушла
         # тому, кто работает именно тогда, а не тому, кто активен в момент
         # клика «подтвердить» (manager_for_visit в coordinator_confirm).
-        st["visit_day"] = resolve_visit_day(period)
+        st["visit_day"] = visit_day_of_month(iso)
         st["visit_hour"] = int(hhmm.split(":")[0])
-        st["visit_date"] = resolve_visit_date(period)
+        st["visit_date"] = iso
         st["visit_slot"] = hhmm
         member_flow = "member_training_already" in st
         snapshot = dict(st)
@@ -2591,20 +2821,69 @@ def on_button(cq):
                                        ("Нет, я другой", "trainer_register_again")]]))
         register_trainer(chat_id, user, name)
         return api("editMessageText", chat_id=chat_id, message_id=mid,
-            text=f"Готово, {name}! Каждый вечер в 21:00 буду спрашивать свободные "
-                 "окна на завтра — пара кнопок, минута в день.")
+            text=f"Готово, {name}! Каждый вечер в 21:00 присылаю ваши окна на "
+                 "завтра — там же можно поправить любой день недели, на которую "
+                 "открыта запись.\n\n"
+                 "Открыть свои окна можно в любой момент командой /okna.",
+            reply_markup=kb([[("🗓 Мои окна на неделю", "tcal")]]))
 
     if data == "trainer_register_again":
         return step_trainer_register(chat_id, user)
 
-    if data.startswith("tslot:"):
-        _, date, slot = data.split(":", 2)
+    if data == "tcal":
         name = trainer_name_for(chat_id)
         if not name:
+            return step_trainer_register(chat_id, user)
+        text, markup = trainer_week_view(name)
+        return api("editMessageText", chat_id=chat_id, message_id=mid,
+                   parse_mode="HTML", text=text, reply_markup=markup)
+
+    if data.startswith("tday:"):
+        iso = data.split(":", 1)[1]
+        name = trainer_name_for(chat_id)
+        if not name or iso not in horizon_dates():
+            return
+        return api("editMessageText", chat_id=chat_id, message_id=mid, parse_mode="HTML",
+                   text=trainer_day_text(name, iso),
+                   reply_markup=kb(render_trainer_slot_kb(iso, name)))
+
+    if data.startswith("tconfirm:"):
+        # «Всё в силе» из вечерней сверки: тренер посмотрел окна на завтра и
+        # ничего не меняет. Пишем отметку времени — по ней координатор в
+        # утренней сводке видит, кто подтвердил, а кто просто не открыл
+        # сообщение. Пустой день так подтвердить нельзя: иначе «не отмечено»
+        # превратилось бы в «окон нет» и координатор решил бы, что тренер
+        # осознанно закрыл день.
+        iso = data.split(":", 1)[1]
+        name = trainer_name_for(chat_id)
+        if not name or iso not in horizon_dates():
+            return
+        data_now = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
+        if not _trainer_marked(data_now, iso, name):
+            return api("editMessageText", chat_id=chat_id, message_id=mid, parse_mode="HTML",
+                       text=trainer_day_text(name, iso, data_now,
+                                             note="Сначала отметьте часы этого дня."),
+                       reply_markup=kb(render_trainer_slot_kb(iso, name, data_now)))
+
+        def _confirm(d, iso=iso, name=name):
+            rec = (d.setdefault("days", {}).setdefault(iso, {}).get(name) or {})
+            if rec:
+                rec["confirmed_at"] = _now().strftime("%Y-%m-%d %H:%M")
+        gh_update_json(TRAINER_SLOTS_PATH, _confirm, f"{name}: окна подтверждены {iso}")
+        state, _, _ = trainer_day_state(data_now, iso, name)
+        return api("editMessageText", chat_id=chat_id, message_id=mid, parse_mode="HTML",
+                   text=f"✅ Принято — {fmt_date_rel(iso)}: {state}.",
+                   reply_markup=kb([[("✏️ Всё-таки поправить", f"tday:{iso}")],
+                                    [("🗓 Вся неделя", "tcal")]]))
+
+    if data.startswith("tslot:"):
+        _, iso, slot = data.split(":", 2)
+        name = trainer_name_for(chat_id)
+        if not name or iso not in horizon_dates():
             return
 
-        def _toggle(d, date=date, slot=slot, name=name):
-            day = d.setdefault("days", {}).setdefault(date, {})
+        def _toggle(d, iso=iso, slot=slot, name=name):
+            day = d.setdefault("days", {}).setdefault(iso, {})
             rec = day.setdefault(name, {"free": [], "day_off": False, "booked": {}})
             rec["day_off"] = False
             if slot in rec.get("booked", {}):
@@ -2613,50 +2892,74 @@ def on_button(cq):
                 rec["free"].remove(slot)
             else:
                 rec["free"].append(slot)
-        gh_update_json(TRAINER_SLOTS_PATH, _toggle, f"{name}: слот {slot} {date}")
-        return api("editMessageReplyMarkup", chat_id=chat_id, message_id=mid,
-            reply_markup=kb(render_trainer_slot_kb(date, name)))
+        gh_update_json(TRAINER_SLOTS_PATH, _toggle, f"{name}: слот {slot} {iso}")
+        data_now = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
+        return api("editMessageText", chat_id=chat_id, message_id=mid, parse_mode="HTML",
+                   text=trainer_day_text(name, iso, data_now),
+                   reply_markup=kb(render_trainer_slot_kb(iso, name, data_now)))
 
     if data.startswith("tslot_off:"):
-        date = data.split(":", 1)[1]
+        iso = data.split(":", 1)[1]
         name = trainer_name_for(chat_id)
-        if not name:
+        if not name or iso not in horizon_dates():
             return
 
-        def _off(d, date=date, name=name):
-            day = d.setdefault("days", {}).setdefault(date, {})
+        def _off(d, iso=iso, name=name):
+            day = d.setdefault("days", {}).setdefault(iso, {})
             rec = day.setdefault(name, {"free": [], "day_off": False, "booked": {}})
             rec["day_off"] = not rec.get("day_off", False)
             if rec["day_off"]:
                 rec["free"] = []
-        gh_update_json(TRAINER_SLOTS_PATH, _off, f"{name}: весь день {date}")
-        return api("editMessageReplyMarkup", chat_id=chat_id, message_id=mid,
-            reply_markup=kb(render_trainer_slot_kb(date, name)))
+            rec.pop("confirmed_at", None)
+        gh_update_json(TRAINER_SLOTS_PATH, _off, f"{name}: весь день {iso}")
+        data_now = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
+        return api("editMessageText", chat_id=chat_id, message_id=mid, parse_mode="HTML",
+                   text=trainer_day_text(name, iso, data_now),
+                   reply_markup=kb(render_trainer_slot_kb(iso, name, data_now)))
 
     if data.startswith("tslot_week:"):
-        date = data.split(":", 1)[1]
+        iso = data.split(":", 1)[1]
         name = trainer_name_for(chat_id)
-        if not name:
+        if not name or iso not in horizon_dates():
             return
+        data_now = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
+        rec = _trainer_day_rec(data_now, iso, name)
+        free = list(rec.get("free", []))
+        day_off = bool(rec.get("day_off"))
+        if not free and not day_off:
+            return api("editMessageText", chat_id=chat_id, message_id=mid, parse_mode="HTML",
+                       text=trainer_day_text(name, iso, data_now,
+                            note="Сначала отметьте часы в этом дне — тогда перенесу "
+                                 "их на всю неделю."),
+                       reply_markup=kb(render_trainer_slot_kb(iso, name, data_now)))
+        last = horizon_dates()[-1]
 
-        def _week(d, date=date, name=name):
-            base = datetime.strptime(date, "%Y-%m-%d")
-            source = d.get("days", {}).get(date, {}).get(
-                name, {"free": [], "day_off": False})
-            for i in range(7):
-                dd = (base + timedelta(days=i)).strftime("%Y-%m-%d")
-                day = d.setdefault("days", {}).setdefault(dd, {})
-                prev = day.get(name, {})
+        def _week(d, iso=iso, name=name, free=free, day_off=day_off, last=last):
+            dd = datetime.strptime(iso, "%Y-%m-%d")
+            # Копируем ТОЛЬКО внутри горизонта записи. Раньше отсчитывали ровно
+            # 7 дней от выбранной даты: с дальнего края в файл попадали дни,
+            # на которые клиент записаться уже не может — мусор и в файле,
+            # и в сводке координатору.
+            while dd.strftime("%Y-%m-%d") <= last:
+                key = dd.strftime("%Y-%m-%d")
+                day = d.setdefault("days", {}).setdefault(key, {})
+                prev = day.get(name, {}) or {}
+                booked = prev.get("booked", {}) or {}
                 day[name] = {
-                    "free": list(source.get("free", [])),
-                    "day_off": source.get("day_off", False),
-                    "booked": prev.get("booked", {}),
+                    # занятые гостями часы в свободные не возвращаем: иначе
+                    # координатор увидел бы занятый слот как свободного кандидата
+                    "free": [s for s in free if s not in booked],
+                    "day_off": day_off,
+                    "booked": booked,
                     "week_ahead": True,
                 }
-        gh_update_json(TRAINER_SLOTS_PATH, _week, f"{name}: на неделю вперёд с {date}")
-        return api("sendMessage", chat_id=chat_id,
-            text="Готово — эти окна проставлены на 7 дней вперёд. Ежедневных "
-                 "напоминаний не будет, пока не напишете иначе.")
+                dd += timedelta(days=1)
+        gh_update_json(TRAINER_SLOTS_PATH, _week, f"{name}: окна на всю неделю с {iso}")
+        data_now = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
+        return api("editMessageText", chat_id=chat_id, message_id=mid, parse_mode="HTML",
+                   text=trainer_day_text(name, iso, data_now,
+                        note=f"✅ Проставлено на все дни до {fmt_date_short(last)}."),
+                   reply_markup=kb(render_trainer_slot_kb(iso, name, data_now)))
 
     if data == "seg:new":
         with LOCK:
@@ -2774,12 +3077,12 @@ def on_button(cq):
         return step_phone(chat_id, mid, "", direction, fmt=fmt)
 
     if data.startswith("tp:"):
-        _, period, fmt = data.split(":", 2)
-        return step_slots(chat_id, mid, period, fmt)
+        _, iso, fmt = data.split(":", 2)
+        return step_slots(chat_id, mid, iso, fmt)
 
     if data.startswith("sl:"):
-        _, fmt, period, hhmm = data.split(":", 3)
-        return slot_chosen(chat_id, mid, user, fmt, period, hhmm)
+        _, fmt, iso, hhmm = data.split(":", 3)
+        return slot_chosen(chat_id, mid, user, fmt, iso, hhmm)
 
     if data.startswith("confirmvisit:"):
         target = int(data.split(":", 1)[1])
@@ -2944,6 +3247,18 @@ def on_message(msg):
         return api("sendMessage", chat_id=chat_id,
                    text=f"Клуб «Сандов Фитнес», {CLUB}. Телефон {PHONE}.\n"
                         "Наберите /start — помогу и с первым визитом, и по клубу.")
+
+    # Раздел 11: /okna — тренер в любой момент открывает свои окна на всю
+    # неделю записи. Нужно потому, что вечернее сообщение можно случайно
+    # удалить, а дотянуться до дальних дней больше нечем. Команду не
+    # регистрируем через setMyCommands: она бы висела в меню и у клиентов.
+    if text.startswith("/okna") or text.startswith("/окна"):
+        name = trainer_name_for(chat_id)
+        if not name:
+            return step_trainer_register(chat_id, user)
+        week_text, markup = trainer_week_view(name)
+        return api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+                   text=week_text, reply_markup=markup)
 
     # мост открыт: если клиент не тапнул кнопку «Написать», а пишет прямо
     # здесь — в группу уходит только первое такое сообщение (для контроля).
@@ -3322,7 +3637,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-03-v44-locker-rental-in-member-menu"
+VERSION = "2026-10-08-v45-okna-na-nedelyu-i-realnye-daty"
 
 
 @app.route("/health")
