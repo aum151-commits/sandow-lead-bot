@@ -858,6 +858,232 @@ def send_24h_followups():
             f"tg-бот: догоняющее 24ч — {len(sent_ids)}")
 
 
+# ═══════════════════════════ напоминания о визите и контроль недозвона
+#
+# Задача Ольги 13.10.2026, дословно: «напоминаний должно быть два — за 24 часа
+# до назначенной тренировки/экскурсии и второе за 3 часа либо вечером
+# предыдущего дня. Если тренировка или экскурсия на время с 10.00 до 12.00, то
+# надо напоминать вечером предыдущего дня, например в 20.30, и если не ответит —
+# менеджер успеет ему перезвонить и подтвердить. Не надо примешивать
+# координатора в сообщения клиенту — это наша внутренняя кухня, кто и как
+# распределяет».
+#
+# Здесь это и построено. До 13.10.2026 механизма не было ни в этом боте, ни в
+# MAX (проверено по живому коду, облачным задачам и истории правок):
+# подтверждение визита в клубе держалось на звонке менеджера.
+#
+# Часы:
+#   * первое — ровно за 24 часа до визита;
+#   * второе — за 3 часа, а для визитов 10:00–12:00 — вечером накануне в 20:30
+#     (за три часа до утреннего визита человек ещё спит, а менеджеру нужно
+#     время дозвониться);
+#   * не ответил — через час карточка в чат заявок с задачей менеджеру, но
+#     только внутри смены отдела продаж 10:00–22:00: ночью звонить некому.
+#
+# Координатор в клиентских текстах не упоминается: только в служебных карточках.
+
+BOOKINGS_PATH = "data/tg_bookings.json"
+
+FIRST_BEFORE = timedelta(hours=24)
+SECOND_BEFORE = timedelta(hours=3)
+EARLY_FROM_H, EARLY_TO_H = 10, 12
+EVENING_BEFORE_H, EVENING_BEFORE_M = 20, 30
+ESCALATE_AFTER = timedelta(hours=1)
+OP_FROM_H, OP_TO_H = 10, 22
+
+
+def _visit_moment(з):
+    """Момент визита из записи. None — если даты или часа нет."""
+    try:
+        return datetime.strptime(f"{з.get('iso')} {з.get('hhmm')}",
+                                 "%Y-%m-%d %H:%M").replace(tzinfo=MSK)
+    except (TypeError, ValueError):
+        return None
+
+
+def _second_reminder_at(визит):
+    """Второе напоминание: за 3 часа, а для утренних визитов — вечером накануне.
+
+    12:00 входит в утренние: за три часа до него девять утра — человек ещё
+    собирается, а менеджеру звонить и подтверждать будет некогда.
+    """
+    if EARLY_FROM_H <= визит.hour <= EARLY_TO_H:
+        return (визит - timedelta(days=1)).replace(hour=EVENING_BEFORE_H,
+                                                   minute=EVENING_BEFORE_M)
+    return визит - SECOND_BEFORE
+
+
+def _escalation_at(второе):
+    """Через час после второго напоминания, но внутри смены отдела продаж."""
+    м = второе + ESCALATE_AFTER
+    if м.hour >= OP_TO_H:
+        return (м + timedelta(days=1)).replace(hour=OP_FROM_H, minute=0)
+    if м.hour < OP_FROM_H:
+        return м.replace(hour=OP_FROM_H, minute=0)
+    return м
+
+
+def _visit_kind(з):
+    return "тренировка с тренером" if з.get("fmt") == "training" else "экскурсия по клубу"
+
+
+def _reminder_buttons(target):
+    return kb([[("✅ Подтверждаю", f"vconf:{target}")],
+               [("Не смогу — предложите другое время", f"vshift:{target}")]])
+
+
+def _reminder_text(з, какое, визит):
+    """Текст напоминания клиенту. Координатора здесь нет и быть не должно."""
+    имя = (з.get("name") or "").strip()
+    кто = f"{имя}, " if имя else ""
+    тренер = f" Вас ждёт {з['trainer']}." if з.get("trainer") else ""
+    час = з.get("hhmm")
+    if какое == 1:
+        return (f"{кто}напоминаю: завтра, {fmt_date_long(з.get('iso'))}, в {час} — "
+                f"ваша {_visit_kind(з)}.{тренер}\nПодтвердите, пожалуйста.")
+    if EARLY_FROM_H <= визит.hour <= EARLY_TO_H:
+        return (f"{кто}напоминаю: завтра в {час} — ваша {_visit_kind(з)}.{тренер}\n"
+                "Подтвердите, пожалуйста, — будем вас ждать.")
+    return (f"{кто}ваша {_visit_kind(з)} сегодня в {час}.{тренер}\n"
+            "Всё в силе? Подтвердите, пожалуйста.")
+
+
+def _prune_old_bookings(data, now=None):
+    """Визит прошёл — запись больше не нужна (два дня запаса на разбор)."""
+    граница = _iso((now or _now()).date() - timedelta(days=2))
+    for chat_id in [k for k, v in list(data.items()) if (v.get("iso") or "") < граница]:
+        data.pop(chat_id, None)
+
+
+def remember_booking(chat_id, user, st):
+    """Запомнить запись — иначе напоминать не по чему.
+
+    Берём только записи с датой и часом из кнопок: у «своего времени текстом»
+    даты нет, и считать по нему часы нечего. Живой тест Ольги в список не
+    попадает — иначе бот напоминал бы выдуманному гостю.
+    """
+    iso, hhmm = st.get("visit_date"), st.get("visit_slot")
+    if not iso or not hhmm or is_live_test(chat_id):
+        return
+    имя = (st.get("client_name") or user.get("first_name") or "").strip()
+
+    def _записать(d):
+        d[str(chat_id)] = {
+            "name": имя,
+            "phone": st.get("phone", ""),
+            "iso": iso, "hhmm": hhmm, "fmt": st.get("fmt", "training"),
+            "trainer": st.get("trainer_name", ""),
+            "created": datetime.now(MSK).strftime("%Y-%m-%d %H:%M"),
+            "reminded": "", "reminded2": "", "confirmed": "", "declined": "",
+            "escalated": "",
+        }
+        _prune_old_bookings(d)
+    gh_update_json(BOOKINGS_PATH, _записать, f"тг-бот: запись {имя} на {iso} {hhmm}")
+
+
+def _escalate(chat_id, з):
+    """Карточка в чат заявок: клиент не подтвердил, менеджеру звонить."""
+    тренер = f"\n<b>Тренер:</b> {з['trainer']}" if з.get("trainer") else ""
+    send_to_orders(parse_mode="HTML", text=(
+        f"⚠️ <b>ВИЗИТ НЕ ПОДТВЕРЖДЁН — {_visit_kind(з).upper()}</b>\n"
+        f"<b>Когда:</b> {fmt_date_long(з.get('iso'))}, {з.get('hhmm')}{тренер}\n"
+        f"<b>Клиент:</b> {з.get('name') or 'без имени'}"
+        + (f" · <code>{з.get('phone')}</code>" if з.get("phone") else "") + "\n"
+        "Напоминания ушли за сутки и за 3 часа (а для утренних — вечером "
+        "накануне), ответа нет.\n"
+        "<b>Менеджер — созвонитесь и подтвердите встречу.</b> Не подтвердил — "
+        "освободите время, чтобы оно не пропало."))
+
+
+def visit_tick(now=None):
+    """Напоминания клиенту и контроль недозвона. Гоняется каждые 5 минут.
+
+    Не «суточной задачей на 10:00», а сверкой по каждой записи: первое
+    напоминание привязано к часу визита (ровно сутки), второе — к трём часам
+    или к вечеру накануне, общего часа у них нет.
+
+    Второе напоминание не уходит тому, кто уже нажал «Подтверждаю»: ответ дан.
+    Это единственное отступление от правила «напоминаний два» — в пользу клиента.
+    """
+    now = now or datetime.now(MSK)
+    данные = gh_read_json(BOOKINGS_PATH, default={}) or {}
+    первые, вторые, подняли = [], [], []
+    for chat_id, з in данные.items():
+        визит = _visit_moment(з)
+        if not визит or визит < now or з.get("declined"):
+            continue
+        есть_сутки = (визит - now) > timedelta(hours=6)
+        if not з.get("reminded") and есть_сутки and now >= визит - FIRST_BEFORE:
+            api("sendMessage", chat_id=int(chat_id), parse_mode="HTML",
+                text=_reminder_text(з, 1, визит),
+                reply_markup=_reminder_buttons(chat_id))
+            первые.append(chat_id)
+        elif not з.get("reminded2") and now >= _second_reminder_at(визит):
+            if not з.get("confirmed"):
+                api("sendMessage", chat_id=int(chat_id), parse_mode="HTML",
+                    text=_reminder_text(з, 2, визит),
+                    reply_markup=_reminder_buttons(chat_id))
+            вторые.append(chat_id)
+        elif (з.get("reminded2") and not з.get("confirmed") and not з.get("escalated")
+              and now >= _escalation_at(_second_reminder_at(визит))):
+            _escalate(chat_id, з)
+            подняли.append(chat_id)
+
+    if первые or вторые or подняли:
+        метка = now.strftime("%Y-%m-%d %H:%M")
+
+        def _отметить(d, а=первые, б=вторые, в=подняли, м=метка):
+            for i in а:
+                if i in d:
+                    d[i]["reminded"] = м
+            for i in б:
+                if i in d:
+                    d[i]["reminded2"] = м
+            for i in в:
+                if i in d:
+                    d[i]["escalated"] = м
+        gh_update_json(BOOKINGS_PATH, _отметить,
+                       f"тг-бот: напоминания {len(первые)}+{len(вторые)}, "
+                       f"недозвон {len(подняли)}")
+    print(f"[визиты] напоминаний: первых {len(первые)}, вторых {len(вторые)}, "
+          f"не подтвердили {len(подняли)}", flush=True)
+    return {"первые": первые, "вторые": вторые, "подняли": подняли}
+
+
+def visit_answer(chat_id, подтвердил, message_id):
+    """Клиент нажал «Подтверждаю» или «Не смогу»."""
+    данные = gh_read_json(BOOKINGS_PATH, default={}) or {}
+    з = данные.get(str(chat_id)) or {}
+    сейчас = datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
+    когда = f"{fmt_date_long(з.get('iso'))}, {з.get('hhmm')}" if з.get("iso") else ""
+
+    def _отметить(d, i=str(chat_id), c=подтвердил, с=сейчас):
+        if i in d:
+            d[i]["confirmed" if c else "declined"] = с
+            if c:
+                d[i]["escalated"] = с   # подтвердил — поднимать нечего
+    gh_update_json(BOOKINGS_PATH, _отметить,
+                   f"тг-бот: клиент {'подтвердил' if подтвердил else 'просит перенести'} {когда}")
+
+    reply = ("Спасибо, что ответили! Ждём вас — если что-то изменится, напишите "
+             "здесь, поможем." if подтвердил else
+             "Понял, спасибо, что предупредили. Менеджер напишет и предложит "
+             "другое удобное время.")
+    api("editMessageText", chat_id=chat_id, message_id=message_id, text=reply)
+
+    имя = з.get("name") or "Клиент"
+    телефон = f" · <code>{з.get('phone')}</code>" if з.get("phone") else ""
+    if подтвердил:
+        send_to_orders(parse_mode="HTML", text=(
+            f"✅ <b>КЛИЕНТ ПОДТВЕРДИЛ ВИЗИТ</b>\n"
+            f"{имя}{телефон} — {когда}.\nЗвонок не нужен, всё в силе."))
+    else:
+        send_to_orders(parse_mode="HTML", text=(
+            f"⚠️ <b>КЛИЕНТ ПРОСИТ ПЕРЕНЕСТИ</b>\n"
+            f"{имя}{телефон} — {когда}.\n"
+            "<b>Менеджер — свяжитесь и предложите другое время.</b>"))
+
+
 def _daily_scheduler_loop():
     """Внутренний таймер вместо GitHub Actions schedule — тот, как выяснилось
     29.09, реально пропускает срабатывания часами (см. ЗАДАЧИ-ХВОСТ.md).
@@ -889,6 +1115,10 @@ def _daily_scheduler_loop():
             if _DAILY_MARKS["followup_24h_hour"] != hour_key:
                 send_24h_followups()
                 _mark_daily_sent("followup_24h_hour", hour_key)
+            # напоминания о визите — не суточной задачей, а сверкой каждые
+            # 5 минут: общего часа у первого и второго напоминания нет, они
+            # привязаны к часу самого визита (правило Ольги 13.10.2026)
+            visit_tick(now)
         except Exception as exc:
             print(f"[daily-scheduler] {exc}", flush=True)
         time.sleep(300)
@@ -1611,6 +1841,8 @@ def finalize_booking(chat_id, message_id, user, st):
              + (f" Особенности здоровья: {health}." if health else ""))
     if not is_live_test(chat_id):
         push_1c_followup(phone, extra)
+    # Запоминаем запись, чтобы накануне было что подтверждать (13.10.2026)
+    remember_booking(chat_id, user, {**st, "phone": phone})
 
 
 def finalize_member_training(chat_id, message_id, user, st):
@@ -1665,6 +1897,8 @@ def finalize_member_training(chat_id, message_id, user, st):
             "visit_day": st.get("visit_day"), "visit_hour": st.get("visit_hour"),
             "visit_date": st.get("visit_date"), "visit_slot": st.get("visit_slot"),
         }
+    # Член клуба тоже получает напоминания и так же уходит в контроль недозвона
+    remember_booking(chat_id, user, st)
 
 
 def slot_chosen(chat_id, message_id, user, fmt, iso, hhmm):
@@ -1751,6 +1985,16 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who, trainer_
     # защита, что и для рабочей группы/координатора/1С, v35).
     if trainer_name and visit_date and visit_slot and not is_live_test(target_chat_id):
         guest = name or "без имени"
+        # Тренер появляется в записи, по которой считаются напоминания: клиенту
+        # в напоминании пишем, кто его ждёт (координатор в клиентских текстах
+        # не упоминается — правило 13.10.2026).
+        запись = gh_read_json(BOOKINGS_PATH, default={}) or {}
+        if str(target_chat_id) in запись:
+            def _тренера(d, i=str(target_chat_id), т=trainer_name):
+                if i in d:
+                    d[i]["trainer"] = т
+            gh_update_json(BOOKINGS_PATH, _тренера,
+                           f"запись {target_chat_id}: тренер {trainer_name}")
 
         def _book(d, date=visit_date, slot=visit_slot, tname=trainer_name, guest=guest):
             day = d.setdefault("days", {}).setdefault(date, {})
@@ -2808,6 +3052,14 @@ def on_button(cq):
     user = cq.get("from", {})
     api("answerCallbackQuery", callback_query_id=cq["id"])
 
+    if data.startswith("vconf:") or data.startswith("vshift:"):
+        # Ответ на напоминание о визите: кнопка принадлежит тому чату, куда её
+        # отправили, — чужие нажатия игнорируем.
+        target = data.split(":", 1)[1]
+        if str(chat_id) != target:
+            return
+        return visit_answer(chat_id, data.startswith("vconf:"), mid)
+
     if data.startswith("trainer_pick:") or data.startswith("trainer_confirm:"):
         idx = int(data.split(":", 1)[1])
         if not (0 <= idx < len(_TRAINERS)):
@@ -3640,7 +3892,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-13-v47-novyj-offer-i-metka"
+VERSION = "2026-10-13-v48-dva-napominaniya-o-vizite"
 
 
 @app.route("/health")
