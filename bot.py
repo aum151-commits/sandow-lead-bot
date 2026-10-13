@@ -2121,7 +2121,10 @@ def send_to_1c(user, phone, goal, direction, source="", метки=None, fmt="")
         "utm_medium": "bot",
         # Метка кампании шла с прежнего оффера «72 часа» — в отчётах
         # заявки по «Году в подарок» падали бы в чужую строку.
-        "utm_campaign": "god-v-podarok",
+        # 13.10.2026: оффер сменился на «план тренировок в подарок»,
+        # метка обновлена тем же заходом (иначе новые заявки падали бы
+        # в строку снятого оффера).
+        "utm_campaign": "plan-v-podarok",
         "formname": "Telegram-бот сайта",
         "formid": "sandow_lead_bot",
         "tranid": f"tg-{user.get('id')}-{int(time.time())}",
@@ -3637,7 +3640,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-13-v46-plan-trenirovok-v-podarok"
+VERSION = "2026-10-13-v47-novyj-offer-i-metka"
 
 
 @app.route("/health")
