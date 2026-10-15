@@ -84,6 +84,117 @@ GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GH_REPO = os.environ.get("GITHUB_SUBSCRIBERS_REPO", "aum151-commits/sandow-automation").strip()
 GH_PATH = "data/tg_subscribers.json"
 
+# --- Зеркало клиентских данных в России (перенос хранения, 15.10.2026) ---
+#
+# Зачем. По 152-ФЗ (ч. 5 ст. 18) запись и хранение персональных данных россиян
+# должны идти в базах на территории России, а основной путь у бота — приватный
+# репозиторий на GitHub, то есть США. Пока идёт перенос, каждый записанный файл
+# дополнительно уезжает в приватный бакет Яндекс.Облака (ru-central1), и при
+# запуске сервиса копии освежаются. Когда перенос закончится, основным станет
+# бакет, а репозиторий — копией; сейчас наоборот, и это осознанный шаг.
+#
+# Почему своей подписью, а не библиотекой. Выкат бота заливает ТОЛЬКО этот
+# файл, добавить зависимость в образ этим путём нельзя, а тяжёлый boto3 — это
+# ещё и более долгая загрузка образа на бесплатном тарифе: 15.10.2026 сервис
+# отвечал 502 больше сорока минут именно из-за медленного скачивания образа.
+# Подпись AWS SigV4 — тридцать строк на стандартной библиотеке.
+#
+# Всё выключено, пока не задан S3_MIRROR=1: без него бот работает ровно так,
+# как работал. Ошибка зеркала никогда не ломает основную запись — она только
+# попадает в журнал сервиса. Проверить, включилось ли, видно в /health.
+S3_MIRROR = os.environ.get("S3_MIRROR", "").strip() in ("1", "true", "да", "yes")
+S3_BUCKET = os.environ.get("S3_BUCKET", "sandow-lead-data").strip()
+S3_KEY_ID = os.environ.get("S3_KEY_ID", "").strip()
+S3_SECRET = os.environ.get("S3_SECRET", "").strip()
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "https://storage.yandexcloud.net").strip().rstrip("/")
+S3_REGION = "ru-central1"
+# Что освежаем при запуске: те файлы, которые ведёт бот и его отчёты.
+S3_ОСВЕЖИТЬ = ("data/tg_subscribers.json", "data/lead_response_log.json",
+               "data/trainer_subscribers.json", "data/max_subscribers.json")
+
+
+def _s3_подпись(метод, путь, тело):
+    """Заголовки с подписью AWS SigV4 — свой код, без библиотек."""
+    import hashlib
+    import hmac
+
+    хост = S3_ENDPOINT.split("://", 1)[-1]
+    сейчас = datetime.now(timezone.utc)
+    дата = сейчас.strftime("%Y%m%d")
+    метка = сейчас.strftime("%Y%m%dT%H%M%SZ")
+    хэш = hashlib.sha256(тело).hexdigest()
+    подписываем = "host;x-amz-content-sha256;x-amz-date"
+    канонический = "\n".join([
+        метод, путь, "",
+        f"host:{хост}",
+        f"x-amz-content-sha256:{хэш}",
+        f"x-amz-date:{метка}",
+        "", подписываем, хэш])
+    область = f"{дата}/{S3_REGION}/s3/aws4_request"
+    к_подписи = "\n".join([
+        "AWS4-HMAC-SHA256", метка, область,
+        hashlib.sha256(канонический.encode("utf-8")).hexdigest()])
+    ключ = ("AWS4" + S3_SECRET).encode("utf-8")
+    for часть in (дата, S3_REGION, "s3", "aws4_request"):
+        ключ = hmac.new(ключ, часть.encode("utf-8"), hashlib.sha256).digest()
+    подпись = hmac.new(ключ, к_подписи.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "x-amz-date": метка,
+        "x-amz-content-sha256": хэш,
+        "Authorization": (f"AWS4-HMAC-SHA256 Credential={S3_KEY_ID}/{область}, "
+                          f"SignedHeaders={подписываем}, Signature={подпись}"),
+    }
+
+
+def s3_положить(ключ: str, текст: str) -> bool:
+    """Кладёт текст в российский бакет. False — не вышло (или зеркало выключено)."""
+    if not (S3_MIRROR and S3_KEY_ID and S3_SECRET):
+        return False
+    try:
+        тело = текст.encode("utf-8")
+        # Путь кодируется, и один и тот же закодированный путь идёт и в адрес,
+        # и в подпись. Без этого ключ с кириллицей даёт SignatureDoesNotMatch:
+        # S3 считает подпись по закодированному пути, а мы — по сырому
+        # (проверено 15.10.2026: латиница проходит, кириллица падает).
+        путь = f"/{S3_BUCKET}/{_url_quote(ключ, safe='/')}"
+        шапки = _s3_подпись("PUT", путь, тело)
+        шапки["Content-Type"] = "application/json; charset=utf-8"
+        r = requests.put(S3_ENDPOINT + путь, headers=шапки, data=тело, timeout=25)
+        if r.status_code not in (200, 201):
+            print(f"[s3] зеркало {ключ}: {r.status_code} {r.text[:120]}", flush=True)
+            return False
+        return True
+    except Exception as exc:
+        print(f"[s3] зеркало {ключ}: {exc}", flush=True)
+        return False
+
+
+def s3_зеркало(ключ: str, данные) -> None:
+    """Копия файла в России. Вызывается рядом с записью в GitHub и никогда
+    не мешает ей: любая беда зеркала остаётся в журнале сервиса."""
+    if not S3_MIRROR:
+        return
+    try:
+        s3_положить(ключ, json.dumps(данные, ensure_ascii=False, indent=1))
+    except Exception as exc:
+        print(f"[s3] зеркало {ключ}: {exc}", flush=True)
+
+
+def s3_освежить_при_запуске() -> None:
+    """После перезапуска сервиса российская копия может отстать — подтягиваем.
+    Отдельным потоком: загрузка не должна задерживать старт и /health."""
+    if not (S3_MIRROR and S3_KEY_ID and S3_SECRET):
+        return
+    ок = 0
+    for путь in S3_ОСВЕЖИТЬ:
+        try:
+            данные = gh_read_json(путь)
+            if данные and s3_положить(путь, json.dumps(данные, ensure_ascii=False, indent=1)):
+                ок += 1
+        except Exception as exc:
+            print(f"[s3] освежение {путь}: {exc}", flush=True)
+    print(f"[s3] освежено при запуске: {ок} из {len(S3_ОСВЕЖИТЬ)}", flush=True)
+
 app = Flask(__name__)
 
 # Состояние диалога живёт в памяти: он короткий, а ответы всё равно
@@ -408,6 +519,8 @@ def _log_lead_event(user_id, event, who, phone=None):
         w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
         if w.status_code not in (200, 201):
             print(f"[lead-log] запись не прошла: {w.status_code} {w.text[:120]}", flush=True)
+        # Копия в России — рядом с записью в GitHub (перенос хранения 15.10.2026).
+        s3_зеркало(LEADS_GH_PATH, data)
     except Exception as exc:
         print(f"[lead-log] {exc}", flush=True)
 
@@ -439,6 +552,9 @@ def gh_write_json(path, data, message):
         w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
         if w.status_code not in (200, 201):
             print(f"[gh] запись {path}: {w.status_code} {w.text[:120]}", flush=True)
+        else:
+            # Копия в России (перенос хранения 15.10.2026).
+            s3_зеркало(path, data)
     except Exception as exc:
         print(f"[gh] запись {path}: {exc}", flush=True)
 
@@ -468,6 +584,8 @@ def gh_update_json(path, mutate, message, attempts=5):
                 body["sha"] = sha
             w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
             if w.status_code in (200, 201):
+                # Копия в России (перенос хранения 15.10.2026).
+                s3_зеркало(path, data)
                 return data
             if w.status_code != 409:
                 print(f"[gh] обновление {path}: {w.status_code} {w.text[:120]}", flush=True)
@@ -1475,6 +1593,8 @@ def _save_subscriber(user, segment, phone, call_name=None, source=None):
         w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
         if w.status_code not in (200, 201):
             print(f"[base] запись не прошла: {w.status_code} {w.text[:120]}", flush=True)
+        # Копия в России (перенос хранения 15.10.2026).
+        s3_зеркало(GH_PATH, data)
     except Exception as exc:
         print(f"[base] {exc}", flush=True)
 
@@ -4048,7 +4168,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-14-v52-fitness-ekspert-po-imeni"
+VERSION = "2026-10-15-v53-zerkalo-dannyh-v-rossii"
 
 
 @app.route("/health")
@@ -4063,7 +4183,11 @@ def health():
                    # снаружи это было неотличимо от исправной работы.
                    токен_хранилища=bool(GH_TOKEN),
                    вебхук_1с=bool(ONEC_WEBHOOK),
-                   чат_заявок=bool(ORDERS_CHAT))
+                   чат_заявок=bool(ORDERS_CHAT),
+                   # Зеркало клиентских данных в России: видно снаружи, что
+                   # перенос включён, и что ключи доехали до сервиса.
+                   зеркало_россия=bool(S3_MIRROR and S3_KEY_ID and S3_SECRET),
+                   бакет=S3_BUCKET if S3_MIRROR else "")
 
 
 def _self_ping():
@@ -4089,6 +4213,8 @@ def _self_ping():
 
 threading.Thread(target=_self_ping, daemon=True).start()
 threading.Thread(target=_daily_scheduler_loop, daemon=True).start()
+# Свежая российская копия данных сразу после запуска (перенос хранения 15.10.2026).
+threading.Thread(target=s3_освежить_при_запуске, daemon=True).start()
 
 
 if __name__ == "__main__":
