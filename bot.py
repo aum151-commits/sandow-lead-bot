@@ -112,6 +112,26 @@ S3_REGION = "ru-central1"
 S3_ОСВЕЖИТЬ = ("data/tg_subscribers.json", "data/lead_response_log.json",
                "data/trainer_subscribers.json", "data/max_subscribers.json")
 
+# Файлы, для которых ОСНОВНЫМ хранилищем стала Россия (перенос 15.10.2026).
+#
+# Почему именно они: это всё, что бот пишет своим слоем хранения — заявки,
+# подписчики, записи гостей, окна тренеров, счётчик заявок, состояние
+# планировщика. Для них порядок теперь обратный: сначала запись в бакет,
+# потом копия в GitHub. Остальные файлы контура (сводки, отметки продаж,
+# очереди приёма) ведут облачные задачи — они пока пишут в репозиторий, а в
+# Россию идёт копия; их переключение делается отдельным заходом, по одному
+# писателю за раз, потому что каждый — боевой.
+БОТ_ПИШЕТ_САМ = (
+    "data/tg_subscribers.json",
+    "data/lead_response_log.json",
+    "data/site_leads_by_day.json",
+    "data/trainer_subscribers.json",
+    "data/trainer_slots.json",
+    "data/bot_scheduler_state.json",
+    "data/tg_bookings.json",
+    "data/op_active_manager.json",
+)
+
 
 def _s3_подпись(метод, путь, тело):
     """Заголовки с подписью AWS SigV4 — свой код, без библиотек."""
@@ -233,6 +253,11 @@ def s3_зеркало_данных() -> int:
             continue
         if "storage_state" in путь or "state.json" in путь:
             continue          # состояния и снимки входов в бакет не выкладываем
+        if путь in БОТ_ПИШЕТ_САМ:
+            # Эти файлы ведёт бот, и основное хранилище у них — Россия.
+            # Копировать их сюда из репозитория нельзя: в GitHub лежит копия,
+            # которая отстаёт, и такое «зеркало» затёрло бы свежую запись.
+            continue
         if (узел.get("size") or 0) > 2 * 1024 * 1024:
             continue
         try:
@@ -261,20 +286,129 @@ def s3_цикл() -> None:
         time.sleep(900)
 
 
+def _чистый_etag(значение: str) -> str:
+    """ETag без кавычек и без приставки слабой версии.
+
+    Бакет умеет отдавать слабую форму — `W/"abc..."` (поймано 15.10.2026 на
+    живой записи). Если отдать её в `If-Match` как есть, кавычки перепутаются
+    и запись будет отвергнута ВСЕГДА: обновление файла падало пять попыток
+    подряд с «конфликтом» при том, что никто его не трогал. Поэтому значение
+    приводится к обычному виду."""
+    значение = (значение or "").strip()
+    if значение[:2].upper() == "W/":
+        значение = значение[2:]
+    return значение.strip('"')
+
+
+def s3_прочитать(ключ: str):
+    """Читает JSON из российского бакета: (данные, etag) или (None, None)."""
+    if not (S3_MIRROR and S3_KEY_ID and S3_SECRET):
+        return None, None
+    try:
+        путь = f"/{S3_BUCKET}/{_url_quote(ключ, safe='/')}"
+        шапки = _s3_подпись("GET", путь, b"")
+        r = requests.get(S3_ENDPOINT + путь, headers=шапки, timeout=30)
+        if r.status_code != 200:
+            return None, None
+        возврат = json.loads(r.content.decode("utf-8"))
+        return возврат, _чистый_etag(r.headers.get("ETag"))
+    except Exception as exc:
+        print(f"[s3] чтение {ключ}: {exc}", flush=True)
+        return None, None
+
+
+def s3_записать(ключ: str, данные, etag: str | None = None):
+    """Запись в бакет с проверкой версии.
+
+    True — записали. "конфликт" — объект изменился с момента чтения (кто-то
+    успел раньше): вызывающий перечитывает и повторяет. False — не вышло.
+
+    Проверка версии — условная запись `If-Match` по ETag. Это замена той
+    защиты от одновременных правок, которая была у GitHub (ответ 409): окна
+    тренеров вечером правят до 19 человек за несколько минут, и запись
+    «прочитал — изменил — записал» без такой проверки теряет чужие правки.
+    Что бакет это умеет, проверено 15.10.2026: устаревший ETag даёт 412.
+    """
+    if not (S3_MIRROR and S3_KEY_ID and S3_SECRET):
+        return False
+    тело = json.dumps(данные, ensure_ascii=False, indent=1).encode("utf-8")
+    путь = f"/{S3_BUCKET}/{_url_quote(ключ, safe='/')}"
+    шапки = _s3_подпись("PUT", путь, тело)
+    шапки["Content-Type"] = "application/json; charset=utf-8"
+    if etag:
+        шапки["If-Match"] = f'"{etag}"'
+    try:
+        r = requests.put(S3_ENDPOINT + путь, headers=шапки, data=тело, timeout=30)
+    except Exception as exc:
+        print(f"[s3] запись {ключ}: {exc}", flush=True)
+        return False
+    if r.status_code in (200, 201):
+        return True
+    if r.status_code == 412:
+        return "конфликт"
+    print(f"[s3] запись {ключ}: {r.status_code} {r.text[:120]}", flush=True)
+    return False
+
+
+def _в_россии(путь: str) -> bool:
+    """Файл бота: основное хранилище — Россия, GitHub — копия."""
+    return bool(S3_MIRROR) and путь in БОТ_ПИШЕТ_САМ
+
+
+def _gh_read_json_напрямую(path, default=None):
+    """Прежнее чтение из репозитория. Осталось как страховка: если бакет
+    недоступен, бот обязан работать, а не молчать."""
+    try:
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
+        if r.status_code != 200:
+            return default
+        return json.loads(base64.b64decode(r.json()["content"]).decode("utf-8"))
+    except Exception as exc:
+        print(f"[gh] чтение {path}: {exc}", flush=True)
+        return default
+
+
+def _gh_write_json_напрямую(path, data, message):
+    """Прежняя запись в репозиторий — теперь это КОПИЯ российской версии."""
+    try:
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
+        sha = r.json().get("sha") if r.status_code == 200 else None
+        body = {"message": message,
+                "content": base64.b64encode(
+                    json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
+        if sha:
+            body["sha"] = sha
+        w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
+        if w.status_code not in (200, 201):
+            print(f"[gh] копия {path}: {w.status_code} {w.text[:120]}", flush=True)
+    except Exception as exc:
+        print(f"[gh] копия {path}: {exc}", flush=True)
+
+
 def s3_освежить_при_запуске() -> None:
-    """После перезапуска сервиса российская копия может отстать — подтягиваем.
-    Отдельным потоком: загрузка не должна задерживать старт и /health."""
+    """После перезапуска выравниваем два хранилища, и направление у них разное.
+
+    Для файлов бота основное — Россия (перенос 15.10.2026): свежая версия
+    лежит в бакете, её и подкладываем в GitHub-копию. Обратное направление
+    здесь было бы ошибкой: копия в репозитории отстаёт, и «освежение» затёрло
+    бы ею российскую версию — то есть потеряло бы записи.
+
+    Отдельным потоком: сеть не должна задерживать старт и /health.
+    """
     if not (S3_MIRROR and S3_KEY_ID and S3_SECRET):
         return
     ок = 0
-    for путь in S3_ОСВЕЖИТЬ:
+    for путь in БОТ_ПИШЕТ_САМ:
         try:
-            данные = gh_read_json(путь)
-            if данные and s3_положить(путь, json.dumps(данные, ensure_ascii=False, indent=1)):
+            данные, _ = s3_прочитать(путь)
+            if данные is not None:
+                _gh_write_json_напрямую(путь, данные, "перенос: копия из России")
                 ок += 1
         except Exception as exc:
-            print(f"[s3] освежение {путь}: {exc}", flush=True)
-    print(f"[s3] освежено при запуске: {ок} из {len(S3_ОСВЕЖИТЬ)}", flush=True)
+            print(f"[s3] выравнивание {путь}: {exc}", flush=True)
+    print(f"[s3] выравнено при запуске: {ок} из {len(БОТ_ПИШЕТ_САМ)}", flush=True)
 
 app = Flask(__name__)
 
@@ -565,18 +699,13 @@ def log_lead_event(user_id, event, who=None, phone=None):
 
 
 def _log_lead_event(user_id, event, who, phone=None):
-    try:
-        url = f"https://api.github.com/repos/{GH_REPO}/contents/{LEADS_GH_PATH}"
-        r = requests.get(url, headers=_gh_headers(), timeout=30)
-        if r.status_code == 200:
-            payload = r.json()
-            data = json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
-            sha = payload["sha"]
-        else:
-            data, sha = {}, None
+    """Запись в журнал заявок. Основное хранилище — Россия (15.10.2026):
+    пишем в бакет, GitHub получает копию. Условная запись бакета защищает
+    от гонки так же, как прежний ответ 409 у GitHub."""
+    now = datetime.now(MSK)
 
+    def _изменить(data):
         rec = data.get(user_id, {})
-        now = datetime.now(MSK)
         if phone:
             rec["phone"] = phone
         if event == "lead_created":
@@ -592,52 +721,53 @@ def _log_lead_event(user_id, event, who, phone=None):
                     pass
         data[user_id] = rec
 
-        body = {"message": f"lead-log: {event} {user_id}",
-                "content": base64.b64encode(
-                    json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
-        if sha:
-            body["sha"] = sha
-        w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
-        if w.status_code not in (200, 201):
-            print(f"[lead-log] запись не прошла: {w.status_code} {w.text[:120]}", flush=True)
-        # Копия в России — рядом с записью в GitHub (перенос хранения 15.10.2026).
-        s3_зеркало(LEADS_GH_PATH, data)
+    try:
+        gh_update_json(LEADS_GH_PATH, _изменить, f"lead-log: {event} {user_id}")
     except Exception as exc:
         print(f"[lead-log] {exc}", flush=True)
 
 
 def gh_read_json(path, default=None):
-    """Чтение произвольного JSON из хранилища. Нужен модулю распределения:
-    у него своя история, но незачем заводить второй способ ходить в GitHub."""
-    try:
-        url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
-        r = requests.get(url, headers=_gh_headers(), timeout=30)
-        if r.status_code != 200:
-            return default
-        return json.loads(base64.b64decode(r.json()["content"]).decode("utf-8"))
-    except Exception as exc:
-        print(f"[gh] чтение {path}: {exc}", flush=True)
-        return default
+    """Чтение JSON из хранилища.
+
+    ИМЯ ИСТОРИЧЕСКОЕ. С 15.10.2026 основное хранилище клиентских данных —
+    Россия: для файлов, которые ведёт бот, читаем из бакета Яндекс.Облака.
+    Репозиторий на GitHub из основного стал копией (152-ФЗ, ч. 5 ст. 18:
+    запись и хранение — на территории России).
+
+    Если в бакете пусто или он недоступен, берём из GitHub — бот обязан
+    работать, а не молчать, — и тут же подкладываем прочитанное в Россию,
+    чтобы хранилища не разъехались."""
+    if _в_россии(path):
+        данные, _ = s3_прочитать(path)
+        if данные is not None:
+            return данные
+        данные = _gh_read_json_напрямую(path, default)
+        if данные is not None and данные != default:
+            try:
+                s3_зеркало(path, данные)          # догоняем Россию
+            except Exception:                      # noqa: BLE001
+                pass
+        return данные
+    return _gh_read_json_напрямую(path, default)
 
 
 def gh_write_json(path, data, message):
-    try:
-        url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
-        r = requests.get(url, headers=_gh_headers(), timeout=30)
-        sha = r.json().get("sha") if r.status_code == 200 else None
-        body = {"message": message,
-                "content": base64.b64encode(
-                    json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
-        if sha:
-            body["sha"] = sha
-        w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
-        if w.status_code not in (200, 201):
-            print(f"[gh] запись {path}: {w.status_code} {w.text[:120]}", flush=True)
-        else:
-            # Копия в России (перенос хранения 15.10.2026).
-            s3_зеркало(path, data)
-    except Exception as exc:
-        print(f"[gh] запись {path}: {exc}", flush=True)
+    """Запись JSON: сначала Россия, потом копия в GitHub.
+
+    Для файлов бота порядок именно такой — иначе перенос был бы на словах.
+    Если запись в Россию не прошла, всё равно пишем в GitHub (данные дороже
+    схемы) и говорим об этом в журнале сервиса."""
+    if not _в_россии(path):
+        return _gh_write_json_напрямую(path, data, message)
+    _, etag = s3_прочитать(path)
+    итог = s3_записать(path, data, etag)
+    if итог == "конфликт":                     # кто-то успел между чтением и записью
+        _, etag = s3_прочитать(path)
+        итог = s3_записать(path, data, etag)
+    if итог is not True:
+        print(f"[s3] {path}: запись в Россию не прошла — кладу в GitHub-копию", flush=True)
+    _gh_write_json_напрямую(path, data, message)
 
 
 def gh_update_json(path, mutate, message, attempts=5):
@@ -646,7 +776,38 @@ def gh_update_json(path, mutate, message, attempts=5):
     а не пишет один раз поверх снимка, снятого до этого. Нужен для файлов,
     которые правит сразу много людей почти одновременно (окна тренеров
     вечером, до 19 человек за несколько минут) — обычный read-once-write-once
-    ловил 409 и терял запись (инцидент 28-29.09 с followup_24h.yml)."""
+    ловил 409 и терял запись (инцидент 28-29.09 с followup_24h.yml).
+
+    С 15.10.2026 это же правило работает в России: условная запись бакета по
+    ETag (`If-Match`) отвечает 412 — тот же смысл, что 409 у GitHub. Первой
+    пишется Россия, потом GitHub получает копию того же содержимого."""
+    if _в_россии(path):
+        for попытка in range(attempts):
+            данные, etag = s3_прочитать(path)
+            if данные is None:
+                # В бакете файла ещё нет — основу берём из репозитория,
+                # иначе первая же запись затрёт всё, что уже накоплено.
+                данные = _gh_read_json_напрямую(path, {}) or {}
+                etag = None
+            try:
+                mutate(данные)
+            except Exception as exc:
+                print(f"[s3] обновление {path}: правка не применилась: {exc}", flush=True)
+                return None
+            итог = s3_записать(path, данные, etag)
+            if итог is True:
+                _gh_write_json_напрямую(path, данные, message)   # копия
+                return данные
+            if итог == "конфликт":
+                time.sleep(0.5 + попытка * 0.5)     # перечитаем свежее и повторим
+                continue
+            print(f"[s3] обновление {path}: запись в Россию не прошла, "
+                  f"пишу в GitHub-копию", flush=True)
+            _gh_write_json_напрямую(path, данные, message)
+            return данные
+        print(f"[s3] обновление {path}: не удалось после {attempts} попыток", flush=True)
+        return None
+
     for attempt in range(attempts):
         try:
             url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
@@ -1633,22 +1794,18 @@ def save_subscriber(user, segment=None, phone=None, call_name=None, source=None)
 
 
 def _save_subscriber(user, segment, phone, call_name=None, source=None):
-    try:
-        url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
-        r = requests.get(url, headers=_gh_headers(), timeout=30)
-        if r.status_code == 200:
-            payload = r.json()
-            data = json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
-            sha = payload["sha"]
-        else:
-            data, sha = {}, None
+    """База подписчиков. Основное хранилище — Россия (15.10.2026): пишем
+    в бакет, GitHub получает копию. Условная запись бакета по ETag защищает
+    от гонки так же, как прежний ответ 409 у GitHub."""
+    key = str(user.get("id"))
+    сейчас = datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
 
-        key = str(user.get("id"))
+    def _изменить(data):
         rec = data.get(key, {})
         rec.update({
             "name": " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x),
             "username": user.get("username", ""),
-            "last_seen": datetime.now(MSK).strftime("%Y-%m-%d %H:%M"),
+            "last_seen": сейчас,
         })
         rec.setdefault("first_seen", rec["last_seen"])
         if segment:
@@ -1665,17 +1822,16 @@ def _save_subscriber(user, segment, phone, call_name=None, source=None):
             rec.setdefault("source", source)
             rec["source_last"] = source
         data[key] = rec
+        return rec.get("segment", "?")
 
-        body = {"message": f"tg-бот: подписчик {key} ({rec.get('segment', '?')})",
-                "content": base64.b64encode(
-                    json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
-        if sha:
-            body["sha"] = sha
-        w = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
-        if w.status_code not in (200, 201):
-            print(f"[base] запись не прошла: {w.status_code} {w.text[:120]}", flush=True)
-        # Копия в России (перенос хранения 15.10.2026).
-        s3_зеркало(GH_PATH, data)
+    try:
+        сегмент = key
+        данные, etag = (None, None)
+        if _в_россии(GH_PATH):
+            данные, etag = s3_прочитать(GH_PATH)
+        # Имя сегмента нужно только для сообщения коммита — берём из записи.
+        сегмент = (данные or {}).get(key, {}).get("segment") or (segment or "?")
+        gh_update_json(GH_PATH, _изменить, f"tg-бот: подписчик {key} ({сегмент})")
     except Exception as exc:
         print(f"[base] {exc}", flush=True)
 
@@ -4249,7 +4405,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-15-v54-zerkalo-celogo-kontura"
+VERSION = "2026-10-15-v55-rossiya-osnovnoe-hranilishche"
 
 
 @app.route("/health")
