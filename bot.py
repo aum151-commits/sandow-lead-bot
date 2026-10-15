@@ -180,6 +180,87 @@ def s3_зеркало(ключ: str, данные) -> None:
         print(f"[s3] зеркало {ключ}: {exc}", flush=True)
 
 
+def s3_положить_байты(ключ: str, тело: bytes,
+                      тип: str = "application/json; charset=utf-8") -> bool:
+    """Кладёт в бакет готовые байты: в контуре есть и .jsonl, и .csv, и .txt."""
+    if not (S3_MIRROR and S3_KEY_ID and S3_SECRET):
+        return False
+    try:
+        путь = f"/{S3_BUCKET}/{_url_quote(ключ, safe='/')}"
+        шапки = _s3_подпись("PUT", путь, тело)
+        шапки["Content-Type"] = тип
+        r = requests.put(S3_ENDPOINT + путь, headers=шапки, data=тело, timeout=30)
+        if r.status_code not in (200, 201):
+            print(f"[s3] зеркало {ключ}: {r.status_code} {r.text[:120]}", flush=True)
+            return False
+        return True
+    except Exception as exc:
+        print(f"[s3] зеркало {ключ}: {exc}", flush=True)
+        return False
+
+
+def s3_зеркало_данных() -> int:
+    """Копия файлов данных репозитория в Россию — целиком, а не только тех,
+    что пишет бот.
+
+    Почему в боте, а не в задаче GitHub. Расписание GitHub для этой работы
+    проверено 15.10.2026 и оказалось пустым: за три часа ни одного прогона по
+    крону, только ручные — а платформа опаздывает на часы, это её известное
+    свойство (записано в проекте). Будильник расписаний в Cloudflare обновить
+    нельзя: доступ, лежащий в проекте, прав на Workers не имеет, а просить
+    новый — лишняя работа для Ольги. Бот же всегда на связи, у него уже есть и
+    ключ хранилища, и доступ к репозиторию.
+    """
+    if not (S3_MIRROR and S3_KEY_ID and S3_SECRET and GH_TOKEN):
+        return 0
+    try:
+        адрес = f"https://api.github.com/repos/{GH_REPO}/git/trees/main?recursive=1"
+        r = requests.get(адрес, headers=_gh_headers(), timeout=40)
+        if r.status_code != 200:
+            print(f"[s3] список файлов: {r.status_code}", flush=True)
+            return 0
+        узлы = (r.json() or {}).get("tree", [])
+    except Exception as exc:
+        print(f"[s3] список файлов: {exc}", flush=True)
+        return 0
+
+    ок = 0
+    for узел in узлы:
+        путь = узел.get("path", "")
+        if узел.get("type") != "blob" or not путь.startswith("data/"):
+            continue
+        if not путь.endswith((".json", ".jsonl", ".csv", ".txt")):
+            continue
+        if "storage_state" in путь or "state.json" in путь:
+            continue          # состояния и снимки входов в бакет не выкладываем
+        if (узел.get("size") or 0) > 2 * 1024 * 1024:
+            continue
+        try:
+            файл = requests.get(
+                f"https://api.github.com/repos/{GH_REPO}/contents/{_url_quote(путь)}",
+                headers=_gh_headers(), timeout=40)
+            if файл.status_code != 200:
+                continue
+            тело = base64.b64decode(файл.json()["content"])
+        except Exception as exc:
+            print(f"[s3] чтение {путь}: {exc}", flush=True)
+            continue
+        if s3_положить_байты(путь, тело):
+            ок += 1
+    print(f"[s3] зеркало контура: выложено {ок} файлов", flush=True)
+    return ок
+
+
+def s3_цикл() -> None:
+    """Каждые 15 минут обновляет российскую копию, пока сервис жив."""
+    while True:
+        try:
+            s3_зеркало_данных()
+        except Exception as exc:      # цикл не должен умереть от одной ошибки
+            print(f"[s3] цикл зеркала: {exc}", flush=True)
+        time.sleep(900)
+
+
 def s3_освежить_при_запуске() -> None:
     """После перезапуска сервиса российская копия может отстать — подтягиваем.
     Отдельным потоком: загрузка не должна задерживать старт и /health."""
@@ -4168,7 +4249,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-15-v53-zerkalo-dannyh-v-rossii"
+VERSION = "2026-10-15-v54-zerkalo-celogo-kontura"
 
 
 @app.route("/health")
@@ -4215,6 +4296,9 @@ threading.Thread(target=_self_ping, daemon=True).start()
 threading.Thread(target=_daily_scheduler_loop, daemon=True).start()
 # Свежая российская копия данных сразу после запуска (перенос хранения 15.10.2026).
 threading.Thread(target=s3_освежить_при_запуске, daemon=True).start()
+# И дальше каждые 15 минут — надёжнее, чем расписание GitHub, которое
+# 15.10.2026 не запустило задачу зеркала ни разу за три часа.
+threading.Thread(target=s3_цикл, daemon=True).start()
 
 
 if __name__ == "__main__":
