@@ -872,7 +872,8 @@ def trainer_name_for(chat_id):
     """Имя зарегистрированного тренера по его chat_id, или None."""
     data = gh_read_json(TRAINER_GH_PATH, default={}) or {}
     rec = data.get(str(chat_id))
-    return rec.get("name") if rec else None
+    имя = rec.get("name") if rec else None
+    return имя if работает_в_клубе(имя) else None
 
 
 def register_trainer(chat_id, user, name):
@@ -950,7 +951,8 @@ def _free_trainers_for(date, slot):
     days = (gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}).get("days", {})
     day = days.get(date, {})
     return [nm for nm, rec in day.items()
-            if not rec.get("day_off") and slot in rec.get("free", [])
+            if работает_в_клубе(nm) and not rec.get("day_off")
+            and slot in rec.get("free", [])
             and slot not in rec.get("booked", {})]
 
 
@@ -959,7 +961,7 @@ def trainer_chat_id_for(name):
     карточку гостя. None, если ещё не регистрировался."""
     data = gh_read_json(TRAINER_GH_PATH, default={}) or {}
     for cid, rec in data.items():
-        if rec.get("name") == name:
+        if rec.get("name") == name and работает_в_клубе(name):
             return int(cid)
     return None
 
@@ -1090,7 +1092,7 @@ def send_evening_slot_prompt():
     tomorrow = _iso(_today() + timedelta(days=1))
     for chat_id, rec in trainers.items():
         name = rec.get("name")
-        if not name:
+        if not работает_в_клубе(name):
             continue
         state, _, _ = trainer_day_state(data, tomorrow, name)
         if state == "не отмечено":
@@ -1115,7 +1117,7 @@ def send_morning_trainer_reminder():
     today = _iso(_today())
     for chat_id, rec in trainers.items():
         name = rec.get("name")
-        if not name or _trainer_marked(data, today, name):
+        if not работает_в_клубе(name) or _trainer_marked(data, today, name):
             continue
         api("sendMessage", chat_id=int(chat_id), parse_mode="HTML",
             text=f"Не забудьте отметить окна на сегодня, {fmt_date_short(today)}:",
@@ -1142,6 +1144,8 @@ def send_coordinator_summary():
             lines.append("— никто ещё не отметил")
             continue
         for name, rec in day.items():
+            if not работает_в_клубе(name):
+                continue
             if rec.get("day_off"):
                 lines.append(f"{name}: занят весь день")
                 continue
@@ -1155,7 +1159,8 @@ def send_coordinator_summary():
     lines.append("\n<b>Дальше на неделе</b>")
     for d in dates[2:]:
         day = days.get(d, {})
-        opened = [nm for nm, rec in day.items() if not rec.get("day_off")]
+        opened = [nm for nm, rec in day.items()
+                  if работает_в_клубе(nm) and not rec.get("day_off")]
         lines.append(f"{fmt_date_short(d)} — "
                      + (f"открылись: {len(opened)}" if opened else "никто ещё не отметил"))
     api("sendMessage", chat_id=coord_id, parse_mode="HTML", text="\n".join(lines))
@@ -3114,14 +3119,33 @@ _VPT_RE = re.compile(r"\bВПТ\b", re.IGNORECASE)
 
 # Кто вёл консультацию или тренировку. Список с сайта клуба; пополняется
 # без выкладки кода — переменной TRAINERS через запятую.
+# Тренеры, которые больше не работают в клубе.
+#
+# Вычеркнуть имя только из списка ниже — мало: то же имя лежит ещё в двух
+# файлах данных (состав для разбора отметок и регистрация тренера), и оттуда
+# оно возвращалось бы в кнопки записи, в сводку координатору и в вечернюю
+# рассылку окон. Поэтому список один на весь бот, а чтения отсеивают по нему;
+# разовая уборка файлов — `_убрать_ушедших` ниже.
+#
+# Кристина Девакова — ушла в «Спирит» в ТЦ «Город» (сказала Ольга 16.10.2026,
+# просила убрать срочно).
+УШЛИ_ИЗ_КЛУБА = ("Кристина Девакова",)
+
+
+def работает_в_клубе(имя):
+    """False — тренер ушёл: его нет ни в кнопках, ни в сводках, ни в рассылке."""
+    return bool(имя) and имя not in УШЛИ_ИЗ_КЛУБА
+
+
 _TRAINERS = [
     "Дарья Салихова", "Дмитрий Анников", "Евгений Леонтьев", "Ева Каймовская",
     "Александр Купричев", "Юрий Яковлев", "Георгий Шарангия", "Наталья Пожилова",
-    "Сергей Кочубей", "Виктор Савельев", "Кристина Девакова", "Александр Белодурин",
+    "Сергей Кочубей", "Виктор Савельев", "Александр Белодурин",
     "Сергей Зайцев", "Денис Бандурин", "Виктория Устинова", "Нурлан Курбанов",
     "Денис Сандригайло", "Нина Ипатова", "Александр Квасков",
 ]
 _TRAINERS += [t.strip() for t in os.environ.get("TRAINERS", "").split(",") if t.strip()]
+_TRAINERS = [t for t in _TRAINERS if работает_в_клубе(t)]
 
 # Менеджеры отдела продаж. Нужны, чтобы отличить продавца от тренера: в
 # одной строке бывают оба, а ещё случается, что оформлял один менеджер, а
@@ -3201,7 +3225,7 @@ def _refresh_staff():
             _STAFF_CACHE["менеджеры"] = менеджеры
             _STAFF_CACHE["короткие"] = короткие
             _STAFF_CACHE["полные"] = полные
-        тренеры = данные.get("тренеры") or []
+        тренеры = [t for t in (данные.get("тренеры") or []) if работает_в_клубе(t)]
         if тренеры:
             _STAFF_CACHE["тренеры"] = тренеры
     except Exception as exc:
@@ -3313,7 +3337,8 @@ def _expert(text, кроме=""):
     тренера, иначе непонятно, о ком речь.
     """
     _refresh_staff()
-    список = _STAFF_CACHE["тренеры"] or _TRAINERS
+    список = [t for t in (_STAFF_CACHE["тренеры"] or _TRAINERS)
+              if работает_в_клубе(t)]
 
     # как и менеджер, эксперт указывается после телефона — до него клиент
     низкий = _tail_after_phone(text).lower()
@@ -4405,7 +4430,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-15-v55-rossiya-osnovnoe-hranilishche"
+VERSION = "2026-10-16-v56-devakova-ushla"
 
 
 @app.route("/health")
@@ -4448,10 +4473,65 @@ def _self_ping():
         time.sleep(600)
 
 
+def _убрать_ушедших():
+    """Разовая уборка файлов данных от тренеров, которых больше нет в клубе.
+
+    Зачем отдельно от фильтра в коде: в `trainer_subscribers.json` ушедший
+    тренер — это его chat_id, и по нему ему каждый вечер уходили окна и
+    напоминания, а его имя стояло в сводке координатору. Фильтр прячет это
+    от глаз, но запись остаётся живой. Здесь она удаляется по-настоящему.
+
+    Пишем через `gh_update_json`: он ведёт и российский бакет, и копию в
+    репозитории — руками отсюда до бакета не дотянуться (ключей в проекте
+    нет). Уборка идемпотентна: нет ушедших — нет и записи.
+    """
+    try:
+        состав = gh_read_json(TRAINER_GH_PATH, default={}) or {}
+        есть_в_составе = [k for k, r in состав.items()
+                          if not работает_в_клубе((r or {}).get("name"))]
+        if есть_в_составе:
+            имена = [состав[k].get("name") for k in есть_в_составе]
+
+            def _из_состава(d):
+                for k in list(d):
+                    if not работает_в_клубе((d.get(k) or {}).get("name")):
+                        d.pop(k, None)
+
+            gh_update_json(TRAINER_GH_PATH, _из_состава,
+                           f"тренеры: убраны ушедшие из клуба ({', '.join(имена)})")
+            print(f"[состав] убраны ушедшие: {', '.join(имена)}", flush=True)
+
+        окна = gh_read_json(TRAINER_SLOTS_PATH, default={}) or {}
+        найдено = {n for день in (окна.get("days") or {}).values()
+                   for n in (день or {}) if not работает_в_клубе(n)}
+        if найдено:
+            def _из_окон(d):
+                for день in ((d or {}).get("days") or {}).values():
+                    for имя in [n for n in (день or {}) if not работает_в_клубе(n)]:
+                        день.pop(имя, None)
+
+            gh_update_json(TRAINER_SLOTS_PATH, _из_окон,
+                           f"окна: убраны ушедшие из клуба ({', '.join(sorted(найдено))})")
+            print(f"[состав] окна ушедших убраны: {', '.join(sorted(найдено))}", flush=True)
+    except Exception as exc:                      # уборка не должна ронять старт
+        print(f"[состав] уборка ушедших: {exc}", flush=True)
+
+
+def _старт_данных():
+    """Освежение хранилищ, а затем уборка — строго в этом порядке.
+
+    Порядок важен: освежение подкладывает российскую версию файлов в
+    GitHub-копию, и если уборку сделать раньше, копия вернула бы удалённую
+    запись обратно.
+    """
+    s3_освежить_при_запуске()
+    _убрать_ушедших()
+
+
 threading.Thread(target=_self_ping, daemon=True).start()
 threading.Thread(target=_daily_scheduler_loop, daemon=True).start()
 # Свежая российская копия данных сразу после запуска (перенос хранения 15.10.2026).
-threading.Thread(target=s3_освежить_при_запуске, daemon=True).start()
+threading.Thread(target=_старт_данных, daemon=True).start()
 # И дальше каждые 15 минут — надёжнее, чем расписание GitHub, которое
 # 15.10.2026 не запустило задачу зеркала ни разу за три часа.
 threading.Thread(target=s3_цикл, daemon=True).start()
