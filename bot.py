@@ -3182,6 +3182,8 @@ _MANAGER_FULL = {
     "дарья": "Харыбина",
 }
 
+STAFF_PATH = "data/staff/staff.json"
+
 _STAFF_CACHE = {"когда": 0.0, "менеджеры": None, "короткие": None,
                 "полные": None, "тренеры": None, "по_телеграму": None}
 
@@ -3198,7 +3200,7 @@ def _refresh_staff():
     _STAFF_CACHE["когда"] = time.time()
     try:
         r = requests.get(
-            f"https://api.github.com/repos/{MARKS_REPO}/contents/data/staff/staff.json",
+            f"https://api.github.com/repos/{MARKS_REPO}/contents/{STAFF_PATH}",
             headers={"Authorization": f"Bearer {MARKS_TOKEN}",
                      "Accept": "application/vnd.github+json"}, timeout=25)
         if r.status_code != 200:
@@ -4430,7 +4432,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-16-v56-devakova-ushla"
+VERSION = "2026-10-16-v57-devakova-iz-vseh-spiskov"
 
 
 @app.route("/health")
@@ -4513,6 +4515,25 @@ def _убрать_ушедших():
             gh_update_json(TRAINER_SLOTS_PATH, _из_окон,
                            f"окна: убраны ушедшие из клуба ({', '.join(sorted(найдено))})")
             print(f"[состав] окна ушедших убраны: {', '.join(sorted(найдено))}", flush=True)
+
+        # Третье место — список состава, по которому разбираются отметки в чате
+        # продаж. Его ведёт облачная сверка `sync_staff.py`, и она устроена
+        # намеренно осторожно: имя, пропавшее с сайта, она показывает в письме,
+        # но из списка НЕ убирает (переверстали блок — и половина состава
+        # исчезла бы молча). Из-за этого ушедший тренер оставался в списке
+        # навсегда и каждую неделю попадал в письмо как «пропал с сайта».
+        # Здесь убираем его поимённо: для ушедших осторожность не нужна.
+        состав_отметок = gh_read_json(STAFF_PATH, default={}) or {}
+        лишние = [t for t in (состав_отметок.get("тренеры") or [])
+                  if not работает_в_клубе(t)]
+        if лишние:
+            def _из_состава_отметок(d):
+                d["тренеры"] = [t for t in (d.get("тренеры") or [])
+                                if работает_в_клубе(t)]
+
+            gh_update_json(STAFF_PATH, _из_состава_отметок,
+                           f"состав: убраны ушедшие из клуба ({', '.join(лишние)})")
+            print(f"[состав] из списка отметок убраны: {', '.join(лишние)}", flush=True)
     except Exception as exc:                      # уборка не должна ронять старт
         print(f"[состав] уборка ушедших: {exc}", flush=True)
 
