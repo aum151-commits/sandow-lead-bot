@@ -2370,6 +2370,96 @@ OP_SCHEDULE_SHEET_ID = "1B0PuXN-YuE1MFV5A95B8QtCT3dobipq7"
 OP_SCHEDULE_SHEET_NAME = "График ОП"
 
 
+# Кто ушёл из отдела продаж. Клиента ему не отдаём: назначить уволившегося —
+# значит отправить человека к тому, кого в клубе уже нет.
+#
+# Повод, 16.10.2026, слова Ольги: «сейчас клиент назначил тренировку, и
+# менеджером идет уволившаяся Алина». Причина была не в коде, а в источнике:
+# бот читает Google Таблицу «График ОП», а клуб ведёт график файлом, и в
+# таблице Алина осталась рабочей до 30 октября, тогда как в фактическом
+# графике у неё одна смена — 2 октября.
+УШЛИ_ИЗ_ОП = {"алина"}
+# График, собранный из фактического файла клуба (пересобрать-график-оп.py).
+# Читается первым: файл — то, по чему отдел работает, а таблица отстаёт.
+OP_SCHEDULE_PATH = "data/op_schedule.json"
+
+
+def _норма_имени(имя):
+    """«Дарья(парт)» → «Дарья»: в карточке менеджеру нужно обычное имя."""
+    return re.sub(r"\(.*?\)", "", str(имя or "")).strip()
+
+
+def _график_из_листа(ws):
+    """Разбирает лист «График ОП» в {день: {менеджер: [статус, часы]}}.
+
+    Ушедшие из отдела отбрасываются здесь же, на разборе: тогда их не увидит
+    ни ротация, ни «активный менеджер», ни назначение на визит — одна точка
+    отсечения вместо трёх проверок в разных местах.
+    """
+    managers, col = [], 3
+    while col <= ws.max_column:
+        nm = ws.cell(row=1, column=col).value
+        if not nm:
+            break
+        if _норма_имени(nm).lower() not in УШЛИ_ИЗ_ОП:
+            managers.append((nm, col))
+        col += 2
+    schedule = {}
+    for row in range(3, ws.max_row + 1):
+        day = ws.cell(row=row, column=1).value
+        if not isinstance(day, (int, float)):
+            continue
+        day_managers = {}
+        for nm, c in managers:
+            status = str(ws.cell(row=row, column=c).value or "").strip()
+            hours = str(ws.cell(row=row, column=c + 1).value or "").strip()
+            day_managers[nm] = [status, hours]
+        schedule[str(int(day))] = day_managers
+    return schedule, managers
+
+
+def _график_из_файла():
+    """График из фактического файла клуба. None — если его нет или он не на этот месяц."""
+    данные = gh_read_json(OP_SCHEDULE_PATH, default={}) or {}
+    now = datetime.now(MSK)
+    if not данные.get("дни") or данные.get("месяц") != now.strftime("%Y-%m"):
+        return None
+    schedule = {}
+    for день, смены in (данные.get("дни") or {}).items():
+        очищено = {}
+        for имя, запись in (смены or {}).items():
+            if _норма_имени(имя).lower() in УШЛИ_ИЗ_ОП:
+                continue
+            запись = запись if isinstance(запись, list) else ["", ""]
+            очищено[имя] = [str(запись[0] or ""), str(запись[1] or "")] \
+                if len(запись) > 1 else ["", ""]
+        schedule[str(день)] = очищено
+    return schedule
+
+
+def _применить_график(schedule, источник):
+    """Считает активного менеджера на сейчас и запоминает график в памяти."""
+    now = datetime.now(MSK)
+    today_rec = schedule.get(str(now.day), {})
+    active = _rotate_manager(today_rec, now.hour)
+    working_today = [nm for nm, (status, hours) in today_rec.items()
+                     if status.lower().startswith("раб") and _SHIFT_HOURS_RE.match(hours.strip())]
+    result = {
+        "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M"),
+        "active_manager": active, "working_today": working_today,
+        "computed_at": now.isoformat(), "источник": источник, "schedule": schedule,
+    }
+    _ACTIVE_MGR["data"] = result
+    _ACTIVE_MGR["ts"] = time.time()
+    # Запись в GitHub — только для наглядности (посмотреть текущий расчёт
+    # снаружи), сам бот её больше не читает. Провалится — не страшно,
+    # активный менеджер всё равно посчитан и лежит в памяти.
+    gh_write_json("data/op_active_manager.json", result,
+                  f"график ОП: активный {active or '—'} ({now.strftime('%H:%M')})")
+    print(f"[op-schedule] обновлено ({источник}), активный менеджер: {active or '—'}",
+          flush=True)
+
+
 def refresh_op_schedule():
     """Раньше — op_schedule_sync.yml (sandow-lp), отдельный workflow раз в
     20 минут. Перенесено внутрь бота 30.09.2026 по прямой просьбе Ольги:
@@ -2383,6 +2473,18 @@ def refresh_op_schedule():
     if not GOOGLE_SHEETS_SA_KEY:
         print("[op-schedule] GOOGLE_SHEETS_SA_KEY не задан — расчёт выключен", flush=True)
         return
+    # Сначала фактический график клуба (файл, собранный в общее хранилище).
+    # Он главнее таблицы: отдел работает по нему, а таблица отстаёт — именно
+    # из-за этого клиенту назначили уволившуюся Алину.
+    try:
+        из_файла = _график_из_файла()
+        if из_файла:
+            _применить_график(из_файла, "из файла клуба")
+            return
+        print("[op-schedule] файла графика на этот месяц нет — беру таблицу",
+              flush=True)
+    except Exception as exc:
+        print(f"[op-schedule] файл графика не прочитался: {exc}", flush=True)
     try:
         import io as _io
         from google.oauth2 import service_account
@@ -2403,46 +2505,9 @@ def refresh_op_schedule():
         wb = load_workbook(_io.BytesIO(buf.getvalue()), data_only=True)
         ws = wb[OP_SCHEDULE_SHEET_NAME]
 
-        managers = []
-        col = 3
-        while col <= ws.max_column:
-            nm = ws.cell(row=1, column=col).value
-            if not nm:
-                break
-            managers.append((nm, col))
-            col += 2
-
-        schedule = {}
-        for row in range(3, ws.max_row + 1):
-            day = ws.cell(row=row, column=1).value
-            if not isinstance(day, (int, float)):
-                continue
-            day_managers = {}
-            for nm, c in managers:
-                status = str(ws.cell(row=row, column=c).value or "").strip()
-                hours = str(ws.cell(row=row, column=c + 1).value or "").strip()
-                day_managers[nm] = [status, hours]
-            schedule[str(int(day))] = day_managers
-
-        now = datetime.now(MSK)
-        today_rec = schedule.get(str(now.day), {})
-        active = _rotate_manager(today_rec, now.hour)
-        working_today = [nm for nm, (status, hours) in today_rec.items()
-                          if status.lower().startswith("раб") and _SHIFT_HOURS_RE.match(hours.strip())]
-
-        result = {
-            "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M"),
-            "active_manager": active, "working_today": working_today,
-            "computed_at": now.isoformat(), "schedule": schedule,
-        }
-        _ACTIVE_MGR["data"] = result
-        _ACTIVE_MGR["ts"] = time.time()
-        # Запись в GitHub — только для наглядности (посмотреть текущий расчёт
-        # снаружи), сам бот её больше не читает. Провалится — не страшно,
-        # активный менеджер всё равно посчитан и лежит в памяти.
-        gh_write_json("data/op_active_manager.json", result,
-                      f"график ОП: активный {active or '—'} ({now.strftime('%H:%M')})")
-        print(f"[op-schedule] обновлено, активный менеджер: {active or '—'}", flush=True)
+        schedule, managers = _график_из_листа(ws)
+        _применить_график(schedule, "из Google Таблицы")
+        return
     except Exception as exc:
         print(f"[op-schedule] ошибка: {exc}", flush=True)
 
@@ -5386,7 +5451,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-16-v64-knopka-nomera-ne-propadaet"
+VERSION = "2026-10-17-v65-grafik-op-po-faktu-i-bez-uvolyvshihsya"
 
 
 @app.route("/health")
