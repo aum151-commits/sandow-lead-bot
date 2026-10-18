@@ -142,6 +142,12 @@ S3_ОСВЕЖИТЬ = ("data/tg_subscribers.json", "data/lead_response_log.json"
     "data/conversions/appointments.jsonl",
     "data/conversions/processed_calls.json",
     "data/conversions/callbacks.jsonl",
+    # 19.10.2026: журналы встреч и отметок продаж переехали в Россию. Пишут их
+    # ОБА — облачная задача и бот пометками из чата, поэтому переводились парой.
+    # Зеркалу сюда лезть нельзя: копия в GitHub отстаёт, и она затёрла бы
+    # пометку, которую бот только что принял.
+    "data/conversions/meetings.jsonl",
+    "data/conversions/sales_marks.jsonl",
 )
 
 # Файлы, которые переехали в Россию ПОЛНОСТЬЮ: копия в GitHub больше не
@@ -442,6 +448,55 @@ def _gh_write_json_напрямую(path, data, message):
             print(f"[gh] копия {path}: {w.status_code} {w.text[:120]}", flush=True)
     except Exception as exc:
         print(f"[gh] копия {path}: {exc}", flush=True)
+
+
+def s3_прочитать_текст(ключ: str):
+    """Читает файл из России как текст: (содержимое, версия) или (None, None).
+
+    Отдельно от s3_прочитать намеренно: журналы встреч и отметок продаж — это
+    построчные записи, а не JSON. Разбирать их как JSON нельзя, а построчная
+    запись должна вернуться в бакет ровно тем же текстом, каким была.
+    """
+    if not (S3_MIRROR and S3_KEY_ID and S3_SECRET):
+        return None, None
+    try:
+        путь = f"/{S3_BUCKET}/{_url_quote(ключ, safe='/')}"
+        r = requests.get(S3_ENDPOINT + путь, headers=_s3_подпись("GET", путь, b""),
+                         timeout=30)
+        if r.status_code != 200:
+            return None, None
+        return r.content.decode("utf-8"), _чистый_etag(r.headers.get("ETag"))
+    except Exception as exc:
+        print(f"[s3] чтение {ключ}: {exc}", flush=True)
+        return None, None
+
+
+def s3_положить_текст(ключ: str, текст: str, etag: str | None = None):
+    """Кладёт текст в Россию с условной записью. True / "конфликт" / False.
+
+    Условная запись здесь не украшение: журнал отметок пишут двое — бот и
+    облачная задача. Без неё одновременная пометка двух менеджеров могла бы
+    стереть одну из записей, и никто бы этого не заметил.
+    """
+    if not (S3_MIRROR and S3_KEY_ID and S3_SECRET):
+        return False
+    try:
+        тело = текст.encode("utf-8")
+        путь = f"/{S3_BUCKET}/{_url_quote(ключ, safe='/')}"
+        шапки = _s3_подпись("PUT", путь, тело)
+        if etag:
+            шапки["If-Match"] = etag
+        шапки["Content-Type"] = "application/x-ndjson; charset=utf-8"
+        r = requests.put(S3_ENDPOINT + путь, headers=шапки, data=тело, timeout=30)
+        if r.status_code in (200, 201):
+            return True
+        if r.status_code == 412:
+            return "конфликт"
+        print(f"[s3] запись {ключ}: {r.status_code} {r.text[:120]}", flush=True)
+        return False
+    except Exception as exc:
+        print(f"[s3] запись {ключ}: {exc}", flush=True)
+        return False
 
 
 def s3_освежить_при_запуске() -> None:
@@ -4461,6 +4516,57 @@ def _expert(text, кроме=""):
     return ""
 
 
+def _дописать_в_россии(path, line, replaces_message_id=None, replaces_key=None,
+                       попыток=3) -> bool:
+    """Дописать строку в журнал, который живёт в России.
+
+    Устройство то же, что у GitHub-версии: прочитать, при надобности заменить
+    старую запись с тем же сообщением, дописать, записать. Разница в защите от
+    гонки: не «файл изменился с момента чтения» (ответ 409 у GitHub), а версия
+    объекта (412) — так же, как в облачных задачах.
+    """
+    for _ in range(попыток):
+        было, версия = s3_прочитать_текст(path)
+        if было is None and версия is None:
+            # Файла в России нет. Пустую основу брать нельзя, не убедившись:
+            # первая же запись тогда затрёт всё, что уже накоплено.
+            было, версия = _прочитать_журнал_из_github(path)
+        старое = было or ""
+
+        метка = None
+        if replaces_message_id is not None:
+            метка = f'"message_id": {replaces_message_id}'
+        elif replaces_key:
+            метка = replaces_key
+        if метка:
+            строки = [s for s in старое.splitlines() if s.strip() and метка not in s]
+            старое = ("\n".join(строки) + "\n") if строки else ""
+
+        итог = s3_положить_текст(path, старое + line, версия)
+        if итог is True:
+            return True
+        if итог == "конфликт":
+            continue                      # перечитаем свежее и повторим
+        return False
+    return False
+
+
+def _прочитать_журнал_из_github(path):
+    """Основа журнала из репозитория — на случай, если в России его ещё нет."""
+    if not MARKS_TOKEN:
+        return None, None
+    head = {"Authorization": f"Bearer {MARKS_TOKEN}",
+            "Accept": "application/vnd.github+json"}
+    url = f"https://api.github.com/repos/{MARKS_REPO}/contents/{path}"
+    try:
+        was = requests.get(url, headers=head, timeout=25)
+        if was.status_code == 200:
+            return base64.b64decode(was.json()["content"]).decode("utf-8"), None
+    except Exception as exc:
+        print(f"[отметки] основа из репозитория не прочиталась: {exc}", flush=True)
+    return None, None
+
+
 def _append_to_repo(path, line, replaces_message_id=None, replaces_key=None):
     """Пишет строку в журнал внутри приватного репозитория.
 
@@ -4470,7 +4576,19 @@ def _append_to_repo(path, line, replaces_message_id=None, replaces_key=None):
     replaces_message_id — если менеджер поправил своё сообщение (руководство
     заметило ошибку и написало обратную связь), старую запись надо заменить,
     а не добавить вторую. Иначе одна продажа считалась бы дважды.
+
+    С 19.10.2026 журналы встреч и отметок продаж живут в России — их правит и
+    бот, и облачная задача, поэтому переводились парой. Копии в американском
+    репозитории больше нет. Если Россия не приняла запись — кладём в GitHub,
+    как раньше: потерянная отметка дороже лишней копии, а чинится такая копия
+    одним запуском выгрузки.
     """
+    отметки_в_россии = path in ("data/conversions/meetings.jsonl",
+                                "data/conversions/sales_marks.jsonl")
+    if отметки_в_россии:
+        if _дописать_в_россии(path, line, replaces_message_id, replaces_key):
+            return
+        print("[отметки] в Россию не записалось — кладу в GitHub-копию", flush=True)
     if not MARKS_TOKEN:
         print("[отметки] нет токена репозитория — отметка не сохранена", flush=True)
         return
@@ -5599,7 +5717,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-18-v70-odin-nabor-knopok"
+VERSION = "2026-10-19-v71-vstrechi-i-prodazhi-v-rossii"
 
 
 @app.route("/health")
