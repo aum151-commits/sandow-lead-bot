@@ -2401,8 +2401,13 @@ def _график_из_листа(ws):
         nm = ws.cell(row=1, column=col).value
         if not nm:
             break
-        if _норма_имени(nm).lower() not in УШЛИ_ИЗ_ОП:
-            managers.append((nm, col))
+        чистое = _норма_имени(nm)
+        # «Дарья(парт)» в графике — это пометка о партнёрской смене, а не часть
+        # имени: в карточке менеджеру нужно «Дарья». Если после очистки имя
+        # совпало с уже взятым, второй столбец пропускаем — иначе один человек
+        # затёр бы другого в том же дне.
+        if чистое.lower() not in УШЛИ_ИЗ_ОП and чистое not in (и for и, _ in managers):
+            managers.append((чистое, col))
         col += 2
     schedule = {}
     for row in range(3, ws.max_row + 1):
@@ -2473,14 +2478,21 @@ OP_SCHEDULE_PAGE = "График ОП"
 
 
 def _график_из_облака():
-    """Свежий месячный файл из папки клуба. None — если файла на этот месяц нет.
+    """Свежий график из папки клуба. None — если подходящего файла нет.
+
+    Правило выбора (Ольга, 18.10.2026: «добавила ещё файл График менеджеров —
+    там более актуальная информация»). В папке лежат два разных файла: месячный
+    отчёт, где график идёт приложением, и отдельный файл с графиком по месяцам.
+    Главный — тот, что называется графиком, он обновляется ради графика. В
+    месячном отчёте график отстаёт: в нём, например, пропала целая колонка
+    менеджера, и человек, который работает, клиентов не получал вовсе.
 
     Ловушки, из-за которых это не одна строка:
     1. В папке лежит ЯРЛЫК на файл, а не сам файл. Ярлык не скачивается — надо
-       сперва развернуть его в настоящий файл, иначе всё падает на выгрузке.
+       сперва развернуть его в настоящий файл.
     2. Файл может оказаться файлом Google, а не Excel: тогда скачивание не
        работает, нужна выгрузка. Пробуем оба способа.
-    3. График нужен ИМЕННО этого месяца: рядом лежат прошлые, и взять не тот —
+    3. Месяц берётся ИМЕННО текущий: рядом лежат прошлые, и взять не тот —
        значит назначить клиенту того, кто в этом месяце не работает.
     """
     import io as _io
@@ -2495,52 +2507,59 @@ def _график_из_облака():
     drive = build("drive", "v3", credentials=creds)
 
     now = datetime.now(MSK)
-    месяц = МЕСЯЦЫ_РОД[now.month - 1].lower()
-    год = str(now.year)
+    месяц = МЕСЯЦЫ_РОД[now.month - 1]
+
     файлы = drive.files().list(
         q=f"'{OP_FOLDER_ID}' in parents and trashed=false",
         fields="files(id,name,modifiedTime,mimeType,shortcutDetails)",
         orderBy="modifiedTime desc", pageSize=50).execute().get("files", [])
-    подходящие = [ф for ф in файлы
-                  if месяц in (ф.get("name") or "").lower()
-                  and год in (ф.get("name") or "")]
-    if not подходящие:
-        print(f"[op-schedule] в папке нет файла на {меся} {год}", flush=True)
+    if not файлы:
+        print("[op-schedule] папка клуба пуста", flush=True)
         return None
-    файл = подходящие[0]
-    цель = (файл.get("shortcutDetails") or {}).get("targetId") or файл["id"]
-    print(f"[op-schedule] беру файл «{файл.get('name')}»", flush=True)
+    # Файлы со словом «график» в названии — первыми; внутри групп свежие вперёд.
+    файлы.sort(key=lambda ф: 0 if "график" in (ф.get("name") or "").lower() else 1)
 
-    try:
-        buf = _io.BytesIO()
-        dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=цель))
-        готово = False
-        while not готово:
-            _, готово = dl.next_chunk()
-        содержимое = buf.getvalue()
-    except Exception:
-        содержимое = drive.files().export(
-            fileId=цель,
-            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ).execute()
+    for файл in файлы:
+        цель = (файл.get("shortcutDetails") or {}).get("targetId") or файл["id"]
+        try:
+            try:
+                buf = _io.BytesIO()
+                dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=цель))
+                готово = False
+                while not готово:
+                    _, готово = dl.next_chunk()
+                содержимое = buf.getvalue()
+            except Exception:
+                содержимое = drive.files().export(
+                    fileId=цель,
+                    mimeType=("application/vnd.openxmlformats-officedocument"
+                              ".spreadsheetml.sheet")).execute()
+            wb = load_workbook(_io.BytesIO(содержимое), data_only=True)
+        except Exception as exc:
+            print(f"[op-schedule] «{файл.get('name')}» не открылся: {exc}", flush=True)
+            continue
 
-    wb = load_workbook(_io.BytesIO(содержимое), data_only=True)
-    ws = wb[OP_SCHEDULE_PAGE] if OP_SCHEDULE_PAGE in wb.sheetnames else None
-    if ws is None:
-        # Запасной поиск: лист, у которого в первом столбце написано «Дата».
-        for имя in wb.sheetnames:
-            лист = wb[имя]
+        # Лист месяца важнее общего: в файле по месяцам график лежит на своём листе.
+        for имя_листа in (месяц, OP_SCHEDULE_PAGE):
+            if имя_листа not in wb.sheetnames:
+                continue
+            schedule, менеджеры = _график_из_листа(wb[имя_листа])
+            if schedule:
+                print(f"[op-schedule] беру «{файл.get('name')}», лист «{имя_листа}»",
+                      flush=True)
+                return schedule
+        # Последняя попытка: лист, у которого в первом столбце написано «Дата».
+        for имя_листа in wb.sheetnames:
+            лист = wb[имя_листа]
             if str(лист.cell(row=1, column=1).value or "").strip().lower() == "дата":
-                ws = лист
-                break
-    if ws is None:
-        print("[op-schedule] в файле нет листа с графиком", flush=True)
-        return None
-    schedule, managers = _график_из_листа(ws)
-    if not schedule:
-        print("[op-schedule] лист графика пуст", flush=True)
-        return None
-    return schedule
+                schedule, менеджеры = _график_из_листа(лист)
+                if schedule:
+                    print(f"[op-schedule] беру «{файл.get('name')}», лист «{имя_листа}»",
+                          flush=True)
+                    return schedule
+
+    print("[op-schedule] в папке нет файла с графиком на этот месяц", flush=True)
+    return None
 
 
 def refresh_op_schedule():
@@ -5542,7 +5561,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-18-v66-grafik-op-iz-papki-kluba"
+VERSION = "2026-10-18-v67-grafik-iz-fayla-grafika"
 
 
 @app.route("/health")
