@@ -2460,6 +2460,89 @@ def _применить_график(schedule, источник):
           flush=True)
 
 
+# Папка на Google Диске клуба, куда каждый месяц кладётся файл отдела продаж
+# («ОП SF-Октябрь 2026.xlsx»): график менеджеров и отчёт месяца в одном файле.
+# Доступ дан владельцем лично служебному роботу-аккаунту, только на чтение и
+# только к этой папке (Ольга, 17.10.2026). Отсюда бот берёт СВЕЖИЙ график сам:
+# раньше он читал одну таблицу с постоянным адресом, и в ней остался СЕНТЯБРЬ —
+# из-за этого в октябре клиенту назначили уволившуюся Алину.
+OP_FOLDER_ID = "1NF4YsoG6kYMkaVciFi9AgBMQG5Q8XIpH"
+МЕСЯЦЫ_РОД = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль",
+              "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+OP_SCHEDULE_PAGE = "График ОП"
+
+
+def _график_из_облака():
+    """Свежий месячный файл из папки клуба. None — если файла на этот месяц нет.
+
+    Ловушки, из-за которых это не одна строка:
+    1. В папке лежит ЯРЛЫК на файл, а не сам файл. Ярлык не скачивается — надо
+       сперва развернуть его в настоящий файл, иначе всё падает на выгрузке.
+    2. Файл может оказаться файлом Google, а не Excel: тогда скачивание не
+       работает, нужна выгрузка. Пробуем оба способа.
+    3. График нужен ИМЕННО этого месяца: рядом лежат прошлые, и взять не тот —
+       значит назначить клиенту того, кто в этом месяце не работает.
+    """
+    import io as _io
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    from openpyxl import load_workbook
+
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(GOOGLE_SHEETS_SA_KEY),
+        scopes=["https://www.googleapis.com/auth/drive.readonly"])
+    drive = build("drive", "v3", credentials=creds)
+
+    now = datetime.now(MSK)
+    месяц = МЕСЯЦЫ_РОД[now.month - 1].lower()
+    год = str(now.year)
+    файлы = drive.files().list(
+        q=f"'{OP_FOLDER_ID}' in parents and trashed=false",
+        fields="files(id,name,modifiedTime,mimeType,shortcutDetails)",
+        orderBy="modifiedTime desc", pageSize=50).execute().get("files", [])
+    подходящие = [ф for ф in файлы
+                  if месяц in (ф.get("name") or "").lower()
+                  and год in (ф.get("name") or "")]
+    if not подходящие:
+        print(f"[op-schedule] в папке нет файла на {меся} {год}", flush=True)
+        return None
+    файл = подходящие[0]
+    цель = (файл.get("shortcutDetails") or {}).get("targetId") or файл["id"]
+    print(f"[op-schedule] беру файл «{файл.get('name')}»", flush=True)
+
+    try:
+        buf = _io.BytesIO()
+        dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=цель))
+        готово = False
+        while not готово:
+            _, готово = dl.next_chunk()
+        содержимое = buf.getvalue()
+    except Exception:
+        содержимое = drive.files().export(
+            fileId=цель,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ).execute()
+
+    wb = load_workbook(_io.BytesIO(содержимое), data_only=True)
+    ws = wb[OP_SCHEDULE_PAGE] if OP_SCHEDULE_PAGE in wb.sheetnames else None
+    if ws is None:
+        # Запасной поиск: лист, у которого в первом столбце написано «Дата».
+        for имя in wb.sheetnames:
+            лист = wb[имя]
+            if str(лист.cell(row=1, column=1).value or "").strip().lower() == "дата":
+                ws = лист
+                break
+    if ws is None:
+        print("[op-schedule] в файле нет листа с графиком", flush=True)
+        return None
+    schedule, managers = _график_из_листа(ws)
+    if not schedule:
+        print("[op-schedule] лист графика пуст", flush=True)
+        return None
+    return schedule
+
+
 def refresh_op_schedule():
     """Раньше — op_schedule_sync.yml (sandow-lp), отдельный workflow раз в
     20 минут. Перенесено внутрь бота 30.09.2026 по прямой просьбе Ольги:
@@ -2473,9 +2556,17 @@ def refresh_op_schedule():
     if not GOOGLE_SHEETS_SA_KEY:
         print("[op-schedule] GOOGLE_SHEETS_SA_KEY не задан — расчёт выключен", flush=True)
         return
-    # Сначала фактический график клуба (файл, собранный в общее хранилище).
-    # Он главнее таблицы: отдел работает по нему, а таблица отстаёт — именно
-    # из-за этого клиенту назначили уволившуюся Алину.
+    # Сначала папка клуба: там клуб сам кладёт свежий файл месяца. Это главный
+    # источник — его обновляют люди, и он не устаревает молча.
+    из_облака = None
+    try:
+        из_облака = _график_из_облака()
+    except Exception as exc:
+        print(f"[op-schedule] папка клуба не прочиталась: {exc}", flush=True)
+    if из_облака:
+        _применить_график(из_облака, "из папки клуба")
+        return
+    # Дальше — собранный график и, в последнюю очередь, старая таблица.
     try:
         из_файла = _график_из_файла()
         if из_файла:
@@ -5451,7 +5542,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-17-v65-grafik-op-po-faktu-i-bez-uvolyvshihsya"
+VERSION = "2026-10-18-v66-grafik-op-iz-papki-kluba"
 
 
 @app.route("/health")
