@@ -190,6 +190,7 @@ S3_ОСВЕЖИТЬ = ("data/tg_subscribers.json", "data/lead_response_log.json"
     "data/op_active_manager.json",    # кто сегодня на смене
     "data/staff/staff.json",          # состав: имена и фамилии
     "data/staff/authors.jsonl",       # кто что писал в чате
+    "data/intake/queue.jsonl",        # очередь выгрузок из 1С
 )
 
 # Файлы, которые ведёт MAX-бот: в России они уже основные. Лид-боту они нужны
@@ -5734,7 +5735,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-19-v73-ochered-priema-v-rossii"
+VERSION = "2026-10-19-v74-ochered-priema-v-rossii"
 
 
 @app.route("/health")
