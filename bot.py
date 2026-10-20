@@ -3589,11 +3589,15 @@ def slot_chosen(chat_id, message_id, user, fmt, iso, hhmm):
         # старое сообщение с днём недели — не угадываем дату, а спрашиваем заново
         return step_time(chat_id, fmt, message_id=message_id)
     if hhmm == "own":
-        with LOCK:
-            STATE.setdefault(chat_id, {})["await_own_time"] = True
-        return api("editMessageText", chat_id=chat_id, message_id=message_id,
-                   text="Напишите, пожалуйста, день и время словами — это нужно, "
-                        "чтобы забронировать для вас удобное окно.")
+        # Кнопку «Своё время» убрали 16.10.2026, но в чатах у части клиентов
+        # висит старое сообщение с ней, и нажатие приходит. Раньше бот просил
+        # написать день и время словами — то есть предлагал ровно тот вариант,
+        # которого больше нет. Правка Ольги 20.10.2026: «надо убрать во всех
+        # ботах». Теперь не просим словами и не молчим: показываем часы, потому
+        # что клуб и тренеры работают целыми часами.
+        return step_time(chat_id, fmt, message_id=message_id,
+                         text="Свободное время бронируем целыми часами — "
+                              "выберите удобный час:")
     with LOCK:
         st = STATE.setdefault(chat_id, {})
         # Время записываем вместе с датой: раньше здесь стояло «понедельник,
@@ -5420,21 +5424,11 @@ def on_message(msg):
         # нужно звонить прямо сейчас, хотя клиент ещё отвечает боту.
         return step_time(chat_id, fmt)
 
-    # Раздел 2.3б/«Своё время»: человек не выбрал готовый слот, а пишет
-    # день и время словами — передаём координатору как есть.
-    with LOCK:
-        st = STATE.get(chat_id, {})
-        awaiting_own_time = st.get("await_own_time")
-    if awaiting_own_time and text and not text.startswith("/"):
-        with LOCK:
-            st = STATE.setdefault(chat_id, {})
-            st.pop("await_own_time", None)
-            st["time_pref"] = text.strip()
-            member_flow = "member_training_already" in st
-            snapshot = dict(st)
-        if member_flow:
-            return finalize_member_training(chat_id, None, user, snapshot)
-        return finalize_booking(chat_id, None, user, snapshot)
+    # Варианта «напишите день и время словами» больше нет (правка Ольги
+    # 20.10.2026: «надо убрать во всех ботах»). Ветка с await_own_time удалена
+    # вместе с кнопкой: клуб работает целыми часами, и свободный ввод всё равно
+    # не подтверждался. Старое нажатие обрабатывается в slot_chosen — там бот
+    # показывает часы, а не просит писать текстом.
 
     # после заявки спросили, как обращаться — ловим ответ. Необязательный шаг:
     # что бы человек ни написал дальше, заявка уже ушла и ничего не теряется.
@@ -5766,7 +5760,7 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-19-v74-ochered-priema-v-rossii"
+VERSION = "2026-10-20-v75-bez-svoego-vremeni"
 
 
 @app.route("/health")
