@@ -4859,6 +4859,29 @@ def hook():
     return jsonify(ok=True)
 
 
+# --- Бот «База Сандов» (@SandowBazaBot) -------------------------------------
+# Отдельный бот для тренеров: свои тексты, свой ключ, своя группа заявок.
+# Живёт в этом же сервисе, чтобы не занимать вторые бесплатные часы хостинга
+# и не засыпать ночью. С клиентским ботом не пересекается: другая дверь,
+# другой токен, другая группа. Если переменных нет — просто не включается.
+try:
+    if os.environ.get("BAZA_HOOK_SECRET", "").strip():
+        import baza_bot
+
+        @app.route("/baza/" + os.environ["BAZA_HOOK_SECRET"].strip(), methods=["POST"])
+        def baza_hook():
+            upd = request.get_json(force=True, silent=True) or {}
+            try:
+                baza_bot.разобрать(upd)
+            except Exception as exc:
+                print(f"[baza] {exc}", flush=True)
+            return jsonify(ok=True)
+
+        print("[baza] вход подключён", flush=True)
+except Exception as exc:  # правка не должна ронять клиентского бота
+    print(f"[baza] не подключился: {exc}", flush=True)
+
+
 def handle(upd):
     if "callback_query" in upd:
         return on_button(upd["callback_query"])
