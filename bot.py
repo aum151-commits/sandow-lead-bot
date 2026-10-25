@@ -1845,6 +1845,12 @@ def send_24h_followups():
     if not to_process:
         return
     sent_ids = []
+    # 25.10.2026, просьба Ольги: «если клиент заблокировал бота — надо это
+    # как-то отключить». Кто заблокировал, тому писать нечего: раньше отправка
+    # отказывала, флаг «догнали» не ставился, и бот стучался снова каждый час
+    # (в журнале — «bot was blocked by the user» двадцать с лишним раз в сутки).
+    # Теперь такой клиент помечается, и второго стука не будет.
+    недоступные = {}
     for chat_id, name in to_process:
         hi = f"{name}, возвращаюсь к вам." if name else "Возвращаюсь к вам."
         text = (f"{hi} Самый простой шаг — посмотреть клуб вживую: "
@@ -1853,10 +1859,26 @@ def send_24h_followups():
                 reply_markup=kb([[("Подобрать время", "go")]]))
         if r.get("ok"):
             sent_ids.append(chat_id)
+        else:
+            причина = _клиент_недоступен(r)
+            if причина:
+                недоступные[chat_id] = причина
     if sent_ids:
         gh_update_json(GH_PATH,
             lambda d, ids=sent_ids: [d[i].__setitem__("followed_up_24h", True) for i in ids if i in d],
             f"tg-бот: догоняющее 24ч — {len(sent_ids)}")
+    if недоступные:
+        # Помечаем «догнали», чтобы не писать снова, и записываем причину в
+        # карточку: менеджер увидит, что человек закрыл боту вход — только звонок.
+        def _пометить(d, кого=недоступные):
+            for i, причина in кого.items():
+                if i in d:
+                    d[i]["followed_up_24h"] = True
+                    d[i]["bot_blocked"] = причина
+        gh_update_json(GH_PATH, _пометить,
+                       f"tg-бот: заблокировали бота — {len(недоступные)}")
+        for i, причина in недоступные.items():
+            print(f"[followup] {i}: {причина}", flush=True)
 
 
 # ═══════════════════════════ напоминания о визите и контроль недозвона
@@ -4029,25 +4051,65 @@ def bridge_to_group(chat_id, user, text, message_id=None):
 BRIDGE_TAG = re.compile(r"#id(-?\d+)")
 
 
+def _клиент_недоступен(ответ) -> str:
+    """Почему клиенту не написать вовсе. Пусто — можно писать.
+
+    25.10.2026. Раньше бот молча пытался снова и снова: если человек
+    заблокировал бота, отправка возвращала отказ, флаг «догнали» не ставился,
+    и на следующем часу бот стучался опять — в журнале это выглядело как
+    «bot was blocked by the user» двадцать с лишним раз в сутки.
+    """
+    причина = ((ответ or {}).get("description") or "").strip()
+    низ = причина.lower()
+    if "blocked by the user" in низ:
+        return "Клиент заблокировал бота — отсюда ему не написать, только звонить"
+    if "user is deactivated" in низ or "chat not found" in низ:
+        return "Чат клиента недоступен (аккаунт удалён или закрыт)"
+    if "bot was kicked" in низ:
+        return "Клиент убрал бота из своего чата — только звонить"
+    return ""
+
+
 def bridge_from_group(msg):
-    """Реплай менеджера в группе → клиенту. Работает только на реплаях к боту."""
+    """Реплай менеджера в группе → клиенту. Работает только на реплаях к боту.
+
+    25.10.2026, просьба Ольги: «менеджер ответил в группе — сработало?» и
+    «добавь эту отметку». Раньше бот ставил на ответ менеджера реакцию 👌, и
+    это было плохо по двум причинам: реакции в группе «Sandow заявки»
+    выключены, поэтому Telegram отметку отклонял (в журнале REACTION_INVALID)
+    и менеджер вообще не видел, дошло ли; а отметка ставилась всегда, даже
+    когда отправка клиенту провалилась.
+    Теперь бот отвечает на сообщение менеджера короткой строкой: «отправлено»
+    или «не ушло и почему». Видно всегда, потому что это обычное сообщение,
+    а не реакция.
+    """
     reply = msg.get("reply_to_message") or {}
     tag = BRIDGE_TAG.search(reply.get("text") or "")
     if not tag:
         return False
     target = int(tag.group(1))
+    chat = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
     if not text:
-        api("sendMessage", chat_id=msg["chat"]["id"],
+        api("sendMessage", chat_id=chat,
             reply_to_message_id=msg["message_id"],
             text="Могу передать только текст — напишите словами.")
         return True
-    api("sendMessage", chat_id=target, text=f"Менеджер клуба:\n\n{text}",
-        reply_markup=kb([[("Завершить разговор", "bridge_off")]]))
-    with LOCK:
-        STATE.setdefault(target, {}).setdefault("dlg", []).append(("Менеджер", text))
-    api("setMessageReaction", chat_id=msg["chat"]["id"],
-        message_id=msg["message_id"], reaction=[{"type": "emoji", "emoji": "👌"}])
+    доставлено = api("sendMessage", chat_id=target, text=f"Менеджер клуба:\n\n{text}",
+                     reply_markup=kb([[("Завершить разговор", "bridge_off")]]))
+    if доставлено.get("ok"):
+        отметка = "✅ Отправлено клиенту"
+        with LOCK:
+            STATE.setdefault(target, {}).setdefault("dlg", []).append(("Менеджер", text))
+    else:
+        недоступен = _клиент_недоступен(доставлено)
+        if недоступен:
+            отметка = f"⚠️ Не отправлено. {недоступен}"
+        else:
+            причина = (доставлено.get("description") or "Telegram не ответил").strip()
+            отметка = f"⚠️ Клиенту не ушло: {причина}"
+    api("sendMessage", chat_id=chat, reply_to_message_id=msg["message_id"],
+        text=отметка)
     return True
 
 
@@ -4371,6 +4433,7 @@ _MANAGERS += [m.strip() for m in os.environ.get("MANAGERS", "").split(",") if m.
 # Короткие формы (Лиза, Даша, Настя, Маша) в отметке значат только менеджера —
 # в ФИО клиента так не пишут. Состав сверен с Ольгой 15.09.2026: Тоганидзе
 # уволилась, добавлены Харыбина (опытный парт-таймер) и Куликова. 21.10.2026:
+
 # Потапова тоже уволилась — убрана.
 _MANAGER_SHORT = {
     "лиза": "Рыбалко",
@@ -5790,7 +5853,9 @@ def cron_tick(secret):
 
 # Метка версии: по ней видно, доехал ли новый код до сервера. Render
 # иногда не пересобирает сервис, а без панели управления это не проверить.
-VERSION = "2026-10-20-v77-klientu-bez-rolej"
+# 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
+# попыток писать тому, кто заблокировал бота.
+VERSION = "2026-10-25-v78-otmetka-dostavki"
 
 
 @app.route("/health")
