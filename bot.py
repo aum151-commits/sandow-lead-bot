@@ -876,6 +876,26 @@ def kb(rows):
     return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
 
 
+def кнопки_карточки(chat_id, rows=None, в_работу=True):
+    """Кнопки под карточкой записи: то, что нужно координатору зала, и всегда
+    «Беру в работу» для менеджера.
+
+    Правка Ольги 26.10.2026, дословно: «для менеджера в любом случае кнопка —
+    беру в работу, так? иначе как узнаем, кто взял?». Повод был настоящий:
+    карточка записи уходила в чат заявок вообще без этой кнопки. Заявка из
+    бота в чат приходит именно карточкой записи (по номеру чат не дёргаем,
+    решение 28.09), и по ней нельзя было понять, кто из менеджеров взял
+    человека в работу: журнал SLA (taken_at/taken_by) по записям молчал.
+
+    в_работу=False — для личного сообщения координатору: она не продавец, и
+    менеджерская кнопка в её карточке была бы мусором.
+    """
+    строки = [list(r) for r in (rows or [])]
+    if в_работу:
+        строки.append([("Беру в работу", f"take:{chat_id}")])
+    return kb(строки)
+
+
 def kb_mixed(rows):
     """Клавиатура, где кнопка может быть и ссылкой: ('текст', 'url:https://...')."""
     out = []
@@ -3384,7 +3404,7 @@ def finalize_booking(chat_id, message_id, user, st):
     if тренер:
         lines.append(f"<b>Тренер:</b> {тренер} — подобрал бот")
         group_tail = dm_tail = "\nПодтверждение клиенту отправлено автоматически."
-        markup = kb([])
+        rows = []
     else:
         candidates = (_free_trainers_for(visit_date, visit_slot)
                       if fmt == "training" else [])
@@ -3393,10 +3413,20 @@ def finalize_booking(chat_id, message_id, user, st):
             причина = "\n<b>Автоподбор не смог:</b> " + ПРИЧИНЫ_ОТКАЗА.get(
                 подбор.get("причина"), подбор.get("причина") or "неизвестно")
         if candidates:
-            tail = причина + f"\nСвободны на {time_pref} — выберите тренера:"
-            group_tail = dm_tail = tail
-            markup = kb([[(nm, f"at:{chat_id}:{_TRAINERS.index(nm)}")]
-                          for nm in candidates if nm in _TRAINERS])
+            # Правка Ольги 26.10.2026: список свободных тренеров — это выбор
+            # КООРДИНАТОРА зала, а не менеджера. Раньше карточка заканчивалась
+            # словами «Свободны на … — выберите тренера» без единого адресата, и
+            # в чате заявок это читалось как задача тому, кто её открыл. В
+            # соседней ветке ниже координатора зовут по нику — здесь адресат
+            # теперь тоже назван, и сказано, что менеджеру делать нечего.
+            group_tail = (причина +
+                          f"\n{COORDINATOR_TG} — свободны на {time_pref}. Выберите "
+                          "тренера кнопкой: это решение координатора зала. "
+                          "Менеджеру делать ничего не нужно — клиенту "
+                          "подтверждение уйдёт автоматически.")
+            dm_tail = причина + f"\nСвободны на {time_pref} — выберите тренера:"
+            rows = [[(nm, f"at:{chat_id}:{_TRAINERS.index(nm)}")]
+                    for nm in candidates if nm in _TRAINERS]
         elif fmt == "training":
             # Тренировку с тренером назначает координатор зала — упоминаем её по
             # нику прямо в карточке (решение Ольги 28.09: проще прямого упоминания
@@ -3404,21 +3434,23 @@ def finalize_booking(chat_id, message_id, user, st):
             group_tail = (причина + f"\n{COORDINATOR_TG} — подтвердите время "
                           "клиенту одним нажатием:")
             dm_tail = причина + "\nПодтвердите время клиенту одним нажатием:"
-            markup = kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]])
+            rows = [[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]
         else:
             active = active_manager_name()
             who = f"{active} — вы активный менеджер сейчас, подтвердите" if active else "Менеджер — подтвердите"
             group_tail = dm_tail = f"\n{who} время клиенту одним нажатием:"
-            markup = kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]])
+            rows = [[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]
 
     r = send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
-                        text="\n".join(lines) + group_tail, reply_markup=markup)
+                        text="\n".join(lines) + group_tail,
+                        reply_markup=кнопки_карточки(chat_id, rows))
     booking_mid = (r.get("result") or {}).get("message_id")
     if fmt == "training" and not is_live_test(chat_id):
         coord_id = coordinator_chat_id()
         if coord_id:
             api("sendMessage", chat_id=coord_id, parse_mode="HTML",
-                text="\n".join(lines) + dm_tail, reply_markup=markup)
+                text="\n".join(lines) + dm_tail,
+                reply_markup=кнопки_карточки(chat_id, rows, в_работу=False))
 
     with LOCK:
         STATE[chat_id] = {
@@ -3569,30 +3601,37 @@ def finalize_member_training(chat_id, message_id, user, st):
             api("sendMessage", chat_id=chat_id, text=note)
         card += f"\n<b>Тренер:</b> {тренер} — подобрал бот"
         group_tail = dm_tail = "\n\nТренер назначен автоматически."
-        markup = kb([])
+        rows = []
     else:
         candidates = _free_trainers_for(visit_date, visit_slot)
         причина = "\n\n<b>Автоподбор не смог:</b> " + ПРИЧИНЫ_ОТКАЗА.get(
             подбор.get("причина"), подбор.get("причина") or "неизвестно")
         if candidates:
-            tail = причина + f"\nСвободны на {time_pref} — выберите тренера:"
-            group_tail = dm_tail = tail
-            markup = kb([[(nm, f"at:{chat_id}:{_TRAINERS.index(nm)}")]
-                          for nm in candidates if nm in _TRAINERS])
+            # Та же правка, что и в finalize_booking (26.10.2026): список
+            # тренеров — выбор координатора зала, и он назван в карточке.
+            group_tail = (причина +
+                          f"\n{COORDINATOR_TG} — свободны на {time_pref}. Выберите "
+                          "тренера кнопкой: это решение координатора зала. "
+                          "Менеджеру делать ничего не нужно — клиенту "
+                          "подтверждение уйдёт автоматически.")
+            dm_tail = причина + f"\nСвободны на {time_pref} — выберите тренера:"
+            rows = [[(nm, f"at:{chat_id}:{_TRAINERS.index(nm)}")]
+                    for nm in candidates if nm in _TRAINERS]
         else:
             group_tail = (причина + f"\n{COORDINATOR_TG} — подтвердите время "
                           "клиенту одним нажатием:")
             dm_tail = причина + "\nПодтвердите время клиенту одним нажатием:"
-            markup = kb([[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]])
+            rows = [[("✅ Подтвердить время", f"confirmvisit:{chat_id}")]]
 
     r = send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
-        text=f"{card}{group_tail}", reply_markup=markup)
+        text=f"{card}{group_tail}", reply_markup=кнопки_карточки(chat_id, rows))
     booking_mid = (r.get("result") or {}).get("message_id")
     if not is_live_test(chat_id):
         coord_id = coordinator_chat_id()
         if coord_id:
             api("sendMessage", chat_id=coord_id, parse_mode="HTML",
-                text=f"{card}{dm_tail}", reply_markup=markup)
+                text=f"{card}{dm_tail}",
+                reply_markup=кнопки_карточки(chat_id, rows, в_работу=False))
     with LOCK:
         STATE[chat_id] = {
             "segment": "member", "fmt": "training", "time_pref": time_pref,
@@ -3761,8 +3800,14 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who, trainer_
     # есть; но запасной выход send_to_orders мог увести карточку в личку Ольги,
     # и тогда редактировать нечего. Пустой id — просто не трогаем разметку.
     if message_id:
+        # «Беру в работу» не теряем: после того как тренер назначен, менеджеру
+        # всё ещё нужно отметить, кто взял клиента. Раньше здесь разметка
+        # заменялась одной строкой-отметкой, и кнопка исчезала — то есть
+        # назначение тренера отбирало у менеджера единственный способ
+        # засвидетельствовать взятие (правка Ольги 26.10.2026).
         api("editMessageReplyMarkup", chat_id=group_chat_id, message_id=message_id,
-            reply_markup=kb([[(confirmed_label, "noop")]]))
+            reply_markup=кнопки_карточки(target_chat_id,
+                                         [[(confirmed_label, "noop")]]))
 
     # Правка Ольги 28.09: после подтверждения — явная задача дежурному
     # менеджеру в чат заявок (не в 1С — там задачи ставить нельзя, API
@@ -4433,7 +4478,6 @@ _MANAGERS += [m.strip() for m in os.environ.get("MANAGERS", "").split(",") if m.
 # Короткие формы (Лиза, Даша, Настя, Маша) в отметке значат только менеджера —
 # в ФИО клиента так не пишут. Состав сверен с Ольгой 15.09.2026: Тоганидзе
 # уволилась, добавлены Харыбина (опытный парт-таймер) и Куликова. 21.10.2026:
-
 # Потапова тоже уволилась — убрана.
 _MANAGER_SHORT = {
     "лиза": "Рыбалко",
@@ -5333,6 +5377,13 @@ def on_button(cq):
     if data.startswith("take:"):
         who = cq["from"].get("first_name", "менеджер")
         old = cq["message"].get("text", "")
+        # Повторный клик не должен плодить строки «В работе»: ответ на вопрос
+        # «кто взял» — первая строка, и её мы не переписываем. Кнопка теперь
+        # висит на каждой карточке записи, кликов будет больше, чем раньше.
+        if "✅ В работе:" in old:
+            return api("answerCallbackQuery", callback_query_id=cq["id"],
+                       text="Уже в работе: "
+                            + old.split("✅ В работе:")[-1].strip().splitlines()[0][:60])
         api("editMessageText", chat_id=chat_id, message_id=mid,
             text=old + f"\n\n✅ В работе: {who}")
         log_lead_event(data.split(":", 1)[1], "taken", who)
@@ -5750,7 +5801,11 @@ def site_lead():
                         + (f"Страница: {page}. " if page else "")
                         + f"Подарок: {GIFT}.")
     text += send_to_1c(user, phone, "keep", "any", f"страница: {page}", метки)
-    send_to_orders(text=text, parse_mode="HTML")
+    # «Беру в работу» — как на карточках бота (правка Ольги 26.10.2026: без
+    # этой кнопки не видно, кто взял заявку). У заявки с сайта свой id вида
+    # site-79991234567 — по нему и пишется отметка в журнал SLA.
+    send_to_orders(text=text, parse_mode="HTML",
+                   reply_markup=кнопки_карточки(user["id"]))
     учесть_заявку()
     # Заявка с сайта — в тот же журнал SLA, что и заявки бота. До 27.09.2026
     # журнал видел только Telegram-заявки (которых почти нет), поэтому
@@ -5855,7 +5910,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-10-25-v78-otmetka-dostavki"
+VERSION = "2026-10-26-v79-koordinator-i-vzyatie"
 
 
 @app.route("/health")
