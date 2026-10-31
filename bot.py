@@ -1001,6 +1001,18 @@ def _log_lead_event(user_id, event, who, phone=None):
             rec["phone"] = phone
         if event == "lead_created":
             rec["lead_created_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        elif event == "card_sent":
+            # 30.10.2026, жалоба Ольги: «⏳ Заявка 6 мин без ответа… нажмите
+            # „Беру в работу" на карточке выше. Но выше нет никакой заявки!».
+            # Причина: заявка пишется в журнал сразу по номеру, а карточка в
+            # чат уходит позже (правка 28.09: менеджеру рано звонить, пока
+            # человек отвечает боту). Эскалация же считала время от номера и
+            # требовала нажать кнопку на карточке, которой ещё не было.
+            # Теперь отдельно отмечаем момент, когда карточка реально ушла:
+            # только по нему и считаются напоминания.
+            rec["card_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            if who:
+                rec["card_message_id"] = who
         elif event == "taken" and not rec.get("taken_at"):
             rec["taken_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
             rec["taken_by"] = who or ""
@@ -4301,7 +4313,11 @@ def send_lead(user, phone, goal, direction, source="", fmt=""):
     r = send_to_orders(subject_chat_id=user.get("id"), text=text, parse_mode="HTML",
                         reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
     log_lead_event(user.get("id"), "lead_created", phone=phone)
-    return (r.get("result") or {}).get("message_id")
+    # Момент, когда карточка реально ушла в чат: по нему считаются напоминания
+    # «заявка без ответа» (иначе бот требовал кнопку на карточке, которой нет).
+    карточка_id = (r.get("result") or {}).get("message_id")
+    log_lead_event(user.get("id"), "card_sent", who=str(карточка_id or ""), phone=phone)
+    return карточка_id
 
 
 # Частые вопросы: с сайта заходят с ними чаще, чем с готовностью оставить номер.
@@ -5890,6 +5906,9 @@ def site_lead():
     # журнал видел только Telegram-заявки (которых почти нет), поэтому
     # скорость первого контакта было не по чему считать.
     log_lead_event(user["id"], "lead_created", phone=phone)
+    # Карточка уже в чате (ушла строкой выше) — отмечаем момент, по которому
+    # считаются напоминания «заявка без ответа».
+    log_lead_event(user["id"], "card_sent", phone=phone)
     return _cors(jsonify(ok=True), origin)
 
 
@@ -5989,7 +6008,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-10-26-v81-trenirovka-tolko-koordinator"
+VERSION = "2026-10-31-v82-eskalaciya-po-kartochke"
 
 
 @app.route("/health")
