@@ -4315,8 +4315,11 @@ def send_lead(user, phone, goal, direction, source="", fmt=""):
     log_lead_event(user.get("id"), "lead_created", phone=phone)
     # Момент, когда карточка реально ушла в чат: по нему считаются напоминания
     # «заявка без ответа» (иначе бот требовал кнопку на карточке, которой нет).
+    # Отмечаем только при подтверждённой отправке: если Телеграм не принял
+    # карточку, напоминать про кнопку на ней нельзя.
     карточка_id = (r.get("result") or {}).get("message_id")
-    log_lead_event(user.get("id"), "card_sent", who=str(карточка_id or ""), phone=phone)
+    if карточка_id:
+        log_lead_event(user.get("id"), "card_sent", who=str(карточка_id), phone=phone)
     return карточка_id
 
 
@@ -5899,16 +5902,17 @@ def site_lead():
     # «Беру в работу» — как на карточках бота (правка Ольги 26.10.2026: без
     # этой кнопки не видно, кто взял заявку). У заявки с сайта свой id вида
     # site-79991234567 — по нему и пишется отметка в журнал SLA.
-    send_to_orders(text=text, parse_mode="HTML",
-                   reply_markup=кнопки_карточки(user["id"]))
+    отправлено = send_to_orders(text=text, parse_mode="HTML",
+                                reply_markup=кнопки_карточки(user["id"]))
     учесть_заявку()
     # Заявка с сайта — в тот же журнал SLA, что и заявки бота. До 27.09.2026
     # журнал видел только Telegram-заявки (которых почти нет), поэтому
     # скорость первого контакта было не по чему считать.
     log_lead_event(user["id"], "lead_created", phone=phone)
-    # Карточка уже в чате (ушла строкой выше) — отмечаем момент, по которому
-    # считаются напоминания «заявка без ответа».
-    log_lead_event(user["id"], "card_sent", phone=phone)
+    # Карточка уже в чате — отмечаем момент, по которому считаются напоминания
+    # «заявка без ответа». Только если Телеграм действительно её принял.
+    if (отправлено.get("result") or {}).get("message_id"):
+        log_lead_event(user["id"], "card_sent", phone=phone)
     return _cors(jsonify(ok=True), origin)
 
 
@@ -6008,7 +6012,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-10-31-v82-eskalaciya-po-kartochke"
+VERSION = "2026-10-31-v83-eskalaciya-po-kartochke"
 
 
 @app.route("/health")
