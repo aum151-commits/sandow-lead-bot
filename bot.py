@@ -2958,6 +2958,73 @@ def step_hello(chat_id, message_id=None):
         api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
 
 
+# --------------------------------------------- вопрос о сроке абонемента
+#
+# 31.10.2026, Ольга: «клиенты спрашивают о сроке окончания абонемента, а
+# менеджер не может ответить, пока нет идентифицированного клиента в базе —
+# нужен номер телефона. Сделать так, чтобы как только человек спрашивает о
+# сроке действия абонемента, сразу запросить номер, объяснив, что это нужно
+# для ответа».
+#
+# Поэтому: на такой вопрос бот сначала просит телефон (без него в 1С не найти
+# карточку и срок не назвать), а с номером — отправляет менеджеру карточку
+# «спросил срок абонемента» и соединяет человека с ним.
+RX_СРОК = re.compile(
+    r"(?:срок\w*|окончани\w*|заканчива\w*|законч\w*|конча\w*"
+    r"|когда\s+(?:законч|заканч|конч|истек|истека|заверш)\w*"
+    r"|до\s+какого\s+(?:числа|число|даты)|сколько\s+осталось|остаток\w*"
+    r"|действу\w*\s+до|продлевать|продлить)", re.I)
+# Про цену человек спрашивает другими словами — этот вопрос ведёт в продажу,
+# а не к сроку. Смешивать нельзя: «сколько стоит абонемент» — не про срок.
+RX_ПРО_ЦЕНУ = re.compile(r"стои|цен[аыуе]|прайс|почём|почем|сколько\s+стои|тариф", re.I)
+
+
+def вопросОСроке(text: str) -> bool:
+    """Спрашивает ли человек про срок действия своего абонемента."""
+    t = (text or "").strip()
+    if not t or len(t) > 300:
+        return False
+    if RX_ПРО_ЦЕНУ.search(t):
+        return False
+    if not RX_СРОК.search(t):
+        return False
+    return bool(re.search(r"абонемент|членств|подписк|карт[аыуе]|клуб", t, re.I))
+
+
+def спрос_срок(chat_id, user, message_id=None):
+    """Ответ на вопрос о сроке абонемента: телефон → менеджер → ответ."""
+    phone = lookup_phone(user.get("id"))
+    if not phone:
+        with LOCK:
+            STATE.setdefault(chat_id, {})["await_term_phone"] = True
+        текст = ("Отвечу точно, если найду вашу карточку в клубе — "
+                 "подскажите, пожалуйста, номер телефона, на который оформлен "
+                 "абонемент. По номеру я проверю срок действия и сразу напишу вам.\n\n"
+                 "Можно нажать «Отправить мой номер» — так быстрее всего.")
+        markup = kb_mixed([[("📱 Отправить мой номер", "phone")]])
+        if message_id:
+            return api("editMessageText", chat_id=chat_id, message_id=message_id,
+                       text=текст, reply_markup=markup)
+        return api("sendMessage", chat_id=chat_id, text=текст, reply_markup=markup)
+    return _карточкаСрока(chat_id, user, phone)
+
+
+def _карточкаСрока(chat_id, user, phone):
+    """Карточка менеджеру: человек спросил срок абонемента, номер известен."""
+    send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
+        text=("📆 <b>СПРОСИЛ СРОК АБОНЕМЕНТА</b>\n"
+              f"Телефон: <code>{phone}</code>\n"
+              f"Telegram: {'@' + user['username'] if user.get('username') else 'без ника'}"
+              f" · {datetime.now(MSK).strftime('%d.%m в %H:%M')}\n"
+              "Ответьте клиенту реплаем на это сообщение — уйдёт ему в бот.\n"
+              f"#id{chat_id}"))
+    with LOCK:
+        STATE.setdefault(chat_id, {})["bridge"] = True
+    return api("sendMessage", chat_id=chat_id,
+               text="Спасибо! Уже уточняю срок по вашей карточке — "
+                    "менеджер ответит вам здесь, в этом чате.")
+
+
 def step_member_menu(chat_id, message_id=None, greet=True):
     """Меню действующего члена клуба. Никаких заявок и продаж — только польза.
 
@@ -5321,6 +5388,10 @@ def on_button(cq):
                         "и какие свободны, менеджер ответит вам здесь.")
 
     if data == "member_term":
+        # 31.10.2026: без номера срок не найти в базе. Если номер уже есть —
+        # сразу карточка менеджеру; если нет — сначала просим телефон.
+        if not lookup_phone(user.get("id")):
+            return спрос_срок(chat_id, user, message_id=mid)
         send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
             text=f"📆 <b>СПРОСИЛ СРОК АБОНЕМЕНТА</b>\n{member_card_line(user)}\n"
                  "Ответьте клиенту реплаем на это сообщение — уйдёт ему в бот.\n"
@@ -5517,6 +5588,14 @@ def on_message(msg):
 
     if msg.get("contact"):
         phone = clean_phone(msg["contact"].get("phone_number"))
+        # 31.10.2026: контакт прислан в ответ на вопрос о сроке абонемента —
+        # сразу находим карточку и соединяем с менеджером, без заявки в 1С.
+        with LOCK:
+            st = STATE.setdefault(chat_id, {})
+            ждали_срок = st.pop("await_term_phone", None)
+        if ждали_срок and phone:
+            save_subscriber(user, phone=phone, segment="member")
+            return _карточкаСрока(chat_id, user, phone)
         return finish(chat_id, user, phone)
 
     # Раздел 4 «Справка для налогового вычета»: ждём фото разворота паспорта.
@@ -5712,10 +5791,24 @@ def on_message(msg):
     if PHONE_RE.fullmatch(text or "") or len(re.sub(r"\D", "", text or "")) >= 10:
         phone = clean_phone(text)
         if phone:
+            # 31.10.2026: номер прислан в ответ на вопрос о сроке абонемента.
+            # Тогда не заводим заявку и не зовём в меню, а сразу находим
+            # карточку по номеру и соединяем с менеджером.
+            with LOCK:
+                st = STATE.setdefault(chat_id, {})
+                ждали_срок = st.pop("await_term_phone", None)
+            if ждали_срок:
+                save_subscriber(user, phone=phone, segment="member")
+                return _карточкаСрока(chat_id, user, phone)
             return finish(chat_id, user, phone)
         return api("sendMessage", chat_id=chat_id,
                    text="Не разобрал номер. Пришлите в формате +7 999 123-45-67 "
                         "или нажмите кнопку «Отправить мой номер».")
+
+    # 31.10.2026: вопрос о сроке абонемента. Без номера срок не найти в базе,
+    # поэтому бот сразу просит телефон и объясняет, зачем он нужен.
+    if вопросОСроке(text):
+        return спрос_срок(chat_id, user)
 
     # член клуба написал текстом без моста: не продаём, зовём в диалог
     if _segment(chat_id) == "member":
@@ -6012,7 +6105,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-10-31-v83-eskalaciya-po-kartochke"
+VERSION = "2026-10-31-v84-srok-abonementa-po-nomeru"
 
 
 @app.route("/health")
