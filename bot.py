@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Бот клуба «Сандов Фитнес» — единая точка входа с сайта.
 
@@ -2291,15 +2291,33 @@ def отчёт_о_подтверждении(chat_id, з, какое, вечер
                  f"{имя}{телефон} — {когда}.{тренер}\n"
                  "Подтверждения пока нет — ждём ответа клиента в боте.")
     elif вечером:
-        текст = (f"🔔 <b>НАПОМИНАНИЕ НАКАНУНЕ ВЕЧЕРОМ ОТПРАВЛЕНО</b>\n"
-                 f"{имя}{телефон} — {когда}.{тренер}\n"
-                 "Подтверждения пока нет. Визит завтра — если к утру не "
-                 "ответит, позвоните и уточните, придёт ли.")
+        if з.get("phone"):
+            текст = (f"🔔 <b>НАПОМИНАНИЕ НАКАНУНЕ ВЕЧЕРОМ ОТПРАВЛЕНО</b>\n"
+                     f"{имя}{телефон} — {когда}.{тренер}\n"
+                     "Подтверждения пока нет. Визит завтра — если к утру не "
+                     "ответит, позвоните и уточните, придёт ли.")
+        else:
+            текст = (f"🔔 <b>НАПОМИНАНИЕ НАКАНУНЕ ВЕЧЕРОМ ОТПРАВЛЕНО</b>\n"
+                     f"{имя} — {когда}.{тренер}\n"
+                     "Подтверждения пока нет, телефона у нас тоже нет — визит "
+                     "завтра. Напишите клиенту реплаем на это сообщение, "
+                     "уйдёт ему в бот.")
     else:
-        текст = (f"⚠️ <b>КЛИЕНТ НЕ ПОДТВЕРДИЛ ЗА 3 ЧАСА</b>\n"
-                 f"{имя}{телефон} — {когда}.{тренер}\n"
-                 "Место за клиентом оставлено. <b>Менеджер — позвоните и "
-                 "уточните, придёт ли.</b>")
+        # 02.11.2026, живая жалоба Ольги: в группу пришла запись «Телефон: не
+        # оставлял», а следом «Менеджер — позвоните и уточните». Звонить некуда:
+        # номера нет. Если телефона нет, честнее сказать это прямо и дать
+        # рабочий способ связи — ответ реплаем на карточку уходит клиенту в бот.
+        if з.get("phone"):
+            текст = (f"⚠️ <b>КЛИЕНТ НЕ ПОДТВЕРДИЛ ЗА 3 ЧАСА</b>\n"
+                     f"{имя}{телефон} — {когда}.{тренер}\n"
+                     "Место за клиентом оставлено. <b>Менеджер — позвоните и "
+                     "уточните, придёт ли.</b>")
+        else:
+            текст = (f"⚠️ <b>КЛИЕНТ НЕ ПОДТВЕРДИЛ ЗА 3 ЧАСА</b>\n"
+                     f"{имя} — {когда}.{тренер}\n"
+                     "<b>Телефона нет</b> — клиент его не оставлял, звонить некуда. "
+                     "Напишите ему здесь: ответьте реплаем на это сообщение, "
+                     "и текст уйдёт клиенту в бот.")
     send_to_orders(subject_chat_id=chat_id, parse_mode="HTML", text=текст)
     if какое == 2 and not з.get("confirmed"):
         отчёт_о_провисании(
@@ -3787,6 +3805,16 @@ def finalize_member_training(chat_id, message_id, user, st):
         подтвердить_автоподбор(chat_id, user, тренер, booking_mid)
 
 
+def _продолжитьЗапись(chat_id, user, phone):
+    """Номер получен на шаге записи — сохраняем и продолжаем оформление."""
+    with LOCK:
+        st = STATE.setdefault(chat_id, {})
+        st["phone"] = phone
+    save_subscriber(user, phone=phone, segment=st.get("segment") or "member")
+    return slot_chosen(chat_id, None, user, st.get("fmt", "training"),
+                       st.get("visit_date"), st.get("visit_slot"))
+
+
 def slot_chosen(chat_id, message_id, user, fmt, iso, hhmm):
     if iso not in horizon_dates():
         # старое сообщение с днём недели — не угадываем дату, а спрашиваем заново
@@ -3817,6 +3845,22 @@ def slot_chosen(chat_id, message_id, user, fmt, iso, hhmm):
         st["visit_slot"] = hhmm
         member_flow = "member_training_already" in st
         snapshot = dict(st)
+    # 02.11.2026, живая жалоба Ольги: в группу заявок пришла запись с
+    # «Телефон: не оставлял», и следом просьба «свяжитесь и предложите другое
+    # время» — а связаться нечем. Так бывает у члена клуба, который заходит
+    # через меню и никогда не оставлял номер: обычный новый клиент номер
+    # оставляет обязательно, а клубный путь записи — нет. Оформлять запись без
+    # телефона нельзя: тренеру и координатору некуда позвонить.
+    if not (snapshot.get("phone") or lookup_phone(user.get("id"))):
+        with LOCK:
+            STATE.setdefault(chat_id, {})["await_phone_for_booking"] = True
+        return api("sendMessage", chat_id=chat_id,
+                   text=(f"Записал: {fmt_date_long(iso)}, {hhmm}.\n\n"
+                         "Чтобы оформить запись, нужен номер телефона — по нему "
+                         "координатор и тренер свяжутся, если что-то изменится.\n\n"
+                         "Нажмите, пожалуйста, «Отправить мой номер» или "
+                         "напишите номер сообщением."),
+                   reply_markup=kb_mixed([[("📱 Отправить мой номер", "phone")]]))
     if member_flow:
         return finalize_member_training(chat_id, message_id, user, snapshot)
     finalize_booking(chat_id, message_id, user, snapshot)
@@ -5606,6 +5650,10 @@ def on_message(msg):
         if ждали_срок and phone:
             save_subscriber(user, phone=phone, segment="member")
             return _карточкаСрока(chat_id, user, phone)
+        with LOCK:
+            ждали_запись = STATE.setdefault(chat_id, {}).pop("await_phone_for_booking", None)
+        if ждали_запись and phone:
+            return _продолжитьЗапись(chat_id, user, phone)
         return finish(chat_id, user, phone)
 
     # Раздел 4 «Справка для налогового вычета»: ждём фото разворота паспорта.
@@ -5810,6 +5858,10 @@ def on_message(msg):
             if ждали_срок:
                 save_subscriber(user, phone=phone, segment="member")
                 return _карточкаСрока(chat_id, user, phone)
+            with LOCK:
+                ждали_запись = st.pop("await_phone_for_booking", None)
+            if ждали_запись:
+                return _продолжитьЗапись(chat_id, user, phone)
             return finish(chat_id, user, phone)
         return api("sendMessage", chat_id=chat_id,
                    text="Не разобрал номер. Пришлите, пожалуйста, в формате "
@@ -6116,7 +6168,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-02-v90-ustinova-i-kvaskov-usli"
+VERSION = "2026-11-02-v91-zapis-bez-telefona"
 
 
 @app.route("/health")
