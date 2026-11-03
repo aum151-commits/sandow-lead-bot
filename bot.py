@@ -3042,7 +3042,7 @@ def _карточкаСрока(chat_id, user, phone):
               f"Telegram: {'@' + user['username'] if user.get('username') else 'без ника'}"
               f" · {datetime.now(MSK).strftime('%d.%m в %H:%M')}\n"
               "Ответьте клиенту реплаем на это сообщение — уйдёт ему в бот.\n"
-              f"#id{chat_id}"))
+              f"#id{chat_id} {BRIDGE_MARK}"))
     with LOCK:
         STATE.setdefault(chat_id, {})["bridge"] = True
     return api("sendMessage", chat_id=chat_id, text="Спасибо, номер записал.")
@@ -4269,8 +4269,8 @@ def bridge_to_group(chat_id, user, text, message_id=None):
               f"<b>{who}</b> · {uname}\n"
               f"{pline}\n"
               f"{text}\n\n"
-              f"#id{chat_id}\n"
-              "Ответ реплаем на это сообщение уйдёт клиенту в бот."))
+              f"#id{chat_id} {BRIDGE_MARK}\n"
+              "⚠️ Ответ реплаем на это сообщение уйдёт клиенту в бот."))
     # Подтверждение не пишем: при входе в режим бот уже сказал «передам,
     # ответ придёт сюда». Достаточно тихой реакции на сообщении клиента.
     if message_id:
@@ -4279,6 +4279,13 @@ def bridge_to_group(chat_id, user, text, message_id=None):
 
 
 BRIDGE_TAG = re.compile(r"#id(-?\d+)")
+# 02.11.2026, жалоба Ольги: «реплаем Кирилл ответил, но не зная, что это уходит
+# клиенту, — об этом в сообщении не было указано! Менеджеры всегда реплаем
+# отписываются о статусе работы с клиентом, и эта информация не должна уйти
+# клиенту ни в коем случае!». Причина: пересылалось ВСЁ, у чего в тексте есть
+# метка #id, — а её ставили и на рабочие карточки (отметка тренера, статусы).
+# Теперь в клиента уходит только то, что помечено явно: #клиенту.
+BRIDGE_MARK = "#клиенту"
 
 
 def _клиент_недоступен(ответ) -> str:
@@ -4314,9 +4321,21 @@ def bridge_from_group(msg):
     а не реакция.
     """
     reply = msg.get("reply_to_message") or {}
-    tag = BRIDGE_TAG.search(reply.get("text") or "")
+    текст_карточки = reply.get("text") or reply.get("caption") or ""
+    tag = BRIDGE_TAG.search(текст_карточки)
     if not tag:
         return False
+    # Карточка помечена как «ответ уйдёт клиенту»? Если нет — это рабочая
+    # карточка (отметка тренера, статусы, напоминания), и писать в неё можно
+    # что угодно: клиент этого не увидит.
+    if BRIDGE_MARK not in текст_карточки:
+        chat_ = msg["chat"]["id"]
+        api("sendMessage", chat_id=chat_,
+            reply_to_message_id=msg["message_id"],
+            text="Это рабочая карточка: клиенту ничего не уходит. "
+                 "Написать клиенту можно ответом на карточку с пометкой "
+                 f"«{BRIDGE_MARK}» (она приходит, когда человек пишет боту).")
+        return True
     target = int(tag.group(1))
     chat = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
@@ -5434,7 +5453,7 @@ def on_button(cq):
         send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
             text=f"🔑 <b>СПРОСИЛ ПРО АРЕНДУ ШКАФЧИКА</b>\n{member_card_line(user)}\n"
                  "Ответьте клиенту реплаем на это сообщение — уйдёт ему в бот.\n"
-                 f"#id{chat_id}")
+                 f"#id{chat_id} {BRIDGE_MARK}")
         with LOCK:
             STATE.setdefault(chat_id, {})["bridge"] = True
         return api("editMessageText", chat_id=chat_id, message_id=mid,
@@ -5449,7 +5468,7 @@ def on_button(cq):
         send_to_orders(subject_chat_id=chat_id, parse_mode="HTML",
             text=f"📆 <b>СПРОСИЛ СРОК АБОНЕМЕНТА</b>\n{member_card_line(user)}\n"
                  "Ответьте клиенту реплаем на это сообщение — уйдёт ему в бот.\n"
-                 f"#id{chat_id}")
+                 f"#id{chat_id} {BRIDGE_MARK}")
         with LOCK:
             STATE.setdefault(chat_id, {})["bridge"] = True
         return api("editMessageText", chat_id=chat_id, message_id=mid,
@@ -5667,7 +5686,7 @@ def on_message(msg):
         file_id = photos[-1]["file_id"]
         photo_caption = (f"🧾 <b>СПРАВКА ДЛЯ ВЫЧЕТА — фото паспорта</b>\n{member_card_line(user)}\n"
                           f"Когда справка готова, ответьте клиенту реплаем на это сообщение.\n"
-                          f"#id{chat_id}")
+                          f"#id{chat_id} {BRIDGE_MARK}")
         if is_live_test(chat_id):
             api("sendPhoto", chat_id=chat_id, photo=file_id, parse_mode="HTML",
                 caption="🧪 ТЕСТ (в рабочую группу не отправлено):\n\n" + photo_caption)
@@ -5694,7 +5713,7 @@ def on_message(msg):
             text=f"❄️ <b>ЗАПРОС ЗАМОРОЗКИ</b>\n{member_card_line(user)}\n"
                  f"Клиент указал: {text}\n"
                  "Оформите и подтвердите клиенту реплаем на это сообщение.\n"
-                 f"#id{chat_id}")
+                 f"#id{chat_id} {BRIDGE_MARK}")
         return api("sendMessage", chat_id=chat_id,
                    text=f"Принято: заморозка — {text}. Менеджер подтвердит "
                         "оформление здесь же.")
@@ -6168,7 +6187,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-02-v91-zapis-bez-telefona"
+VERSION = "2026-11-02-v92-otvet-klientu-po-metke"
 
 
 @app.route("/health")
