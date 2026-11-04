@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Бот клуба «Сандов Фитнес» — единая точка входа с сайта.
 
@@ -4423,6 +4423,37 @@ def send_to_1c(user, phone, goal, direction, source="", метки=None, fmt="")
         return "\n\n⚠️ В 1С не попало (нет связи) — занесите вручную"
 
 
+def сообщить_приёмнику(text, chat_id, message_id):
+    """Пересказать карточку приёмнику отметок (@SandowanalyticBot).
+
+    Приёмник — бот-читатель, а боты сообщений друг от друга не получают: карточка
+    заявки в группе для него невидима. Поэтому после отправки карточки бот
+    отправляет её текст приёмнику как обычное сообщение: тот ставит заявку в
+    очередь «ждём результат» и потом напоминает менеджерам.
+    Ничего не ломает: любая ошибка только пишется в журнал.
+    """
+    if not MARKS_SECRET or not message_id:
+        return False
+    try:
+        import requests as _rq
+        обновление = {
+            "message": {
+                "message_id": message_id,
+                "date": int(datetime.now(MSK).timestamp()),
+                "chat": {"id": int(chat_id), "type": "supergroup", "title": "Sandow заявки"},
+                "from": {"id": 0, "is_bot": True, "first_name": "Лид-бот"},
+                "text": text,
+            }
+        }
+        r = _rq.post(f"{MARKS_URL}?s={MARKS_SECRET}", json=обновление, timeout=20)
+        if r.status_code != 200:
+            print(f"[приёмник] {r.status_code}: {r.text[:120]}", flush=True)
+        return r.status_code == 200
+    except Exception as exc:
+        print(f"[приёмник] не смог пересказать карточку: {exc}", flush=True)
+        return False
+
+
 def send_lead(user, phone, goal, direction, source="", fmt=""):
     who = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "без имени"
     uname = f"@{user['username']}" if user.get("username") else "без ника"
@@ -4455,6 +4486,10 @@ def send_lead(user, phone, goal, direction, source="", fmt=""):
     карточка_id = (r.get("result") or {}).get("message_id")
     if карточка_id:
         log_lead_event(user.get("id"), "card_sent", who=str(карточка_id), phone=phone)
+        # 04.11.2026: приёмник отметок не видит карточек от ботов — пересказываем
+        # ему текст, чтобы заявка попала в очередь «ждём результат» и по ней
+        # пришло напоминание менеджерам (Ольга: «бот не напоминает»).
+        сообщить_приёмнику(text, ORDERS_CHAT, карточка_id)
     return карточка_id
 
 
@@ -4556,6 +4591,12 @@ def too_soon(uid):
 # В журнал идут только телефон, тип отметки и кто отметил.
 
 MARKS_SECRET = os.environ.get("MARKS_HOOK_SECRET", "").strip()
+# 04.11.2026. Приёмник отметок (@SandowanalyticBot) не видит сообщений от других
+# ботов — так устроен Телеграм. Поэтому карточку заявки в группе он не находил,
+# очередь «ждём результат» оставалась пустой, и напоминаний по заявкам не было
+# вовсе. Теперь бот сам пересказывает карточку приёмнику: тот видит обычное
+# сообщение с телефоном и ставит его в очередь.
+MARKS_URL = os.environ.get("MARKS_URL", "https://sandow-emergency-leads.pages.dev/marks").strip()
 # токен служебного бота — нужен, чтобы подтвердить приём выгрузки отправителю
 MARKS_BOT_TOKEN = os.environ.get("MARKS_BOT_TOKEN", "").strip()
 SALES_CHAT_TITLE = os.environ.get("SALES_CHAT_TITLE", "Отдел продаж SF").strip()
@@ -6187,7 +6228,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-02-v92-otvet-klientu-po-metke"
+VERSION = "2026-11-04-v93-kartochka-v-privemnik"
 
 
 @app.route("/health")
