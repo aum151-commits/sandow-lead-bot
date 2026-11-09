@@ -5493,8 +5493,8 @@ def on_button(cq):
         with LOCK:
             STATE.setdefault(chat_id, {})["bridge"] = True
         return api("editMessageText", chat_id=chat_id, message_id=mid,
-                   text="Шкафчик в клубе арендовать можно — уточню условия и "
-                        "передам менеджеру, он позвонит вам и подскажет.")
+                   text="Шкафчик в клубе арендовать можно — уточню условия, "
+                        "скоро с вами свяжемся 🙂")
 
     if data == "member_term":
         # 31.10.2026: без номера срок не найти в базе. Если номер уже есть —
@@ -5509,7 +5509,7 @@ def on_button(cq):
         with LOCK:
             STATE.setdefault(chat_id, {})["bridge"] = True
         return api("editMessageText", chat_id=chat_id, message_id=mid,
-                   text="Сейчас уточню у менеджера — он позвонит вам и подскажет.")
+                   text="Сейчас уточню — скоро с вами свяжемся 🙂")
 
     if data == "book_training":
         return api("editMessageText", chat_id=chat_id, message_id=mid,
@@ -6226,7 +6226,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-09-v98-bez-otveta-klientu-iz-gruppy"
+VERSION = "2026-11-09-v99-skorom-svyazhemsya"
 
 
 @app.route("/health")
