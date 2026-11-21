@@ -32,6 +32,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote as _url_quote
 
 import requests
+from html import escape as _escape_html
+from attribution import sanitize_attribution, attribution_text, is_test
 from flask import Flask, request, jsonify
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -1049,7 +1051,7 @@ def учесть_заявку() -> None:
     threading.Thread(target=_работа, daemon=True).start()
 
 
-def log_lead_event(user_id, event, who=None, phone=None):
+def log_lead_event(user_id, event, who=None, phone=None, attribution=None):
     """Пишет момент создания заявки и момент «Беру в работу» — источник для
     метрики SLA (норматив 3 минуты, по разбору с коучем 18.08.2026). Раньше
     такого лога не было нигде: ни у Тильды, ни у бота, поэтому текущее время
@@ -1060,10 +1062,10 @@ def log_lead_event(user_id, event, who=None, phone=None):
     первого контакта считает отдельный отчёт по совпадению номера."""
     if not GH_TOKEN:
         return
-    threading.Thread(target=_log_lead_event, args=(str(user_id), event, who, phone), daemon=True).start()
+    threading.Thread(target=_log_lead_event, args=(str(user_id), event, who, phone, attribution), daemon=True).start()
 
 
-def _log_lead_event(user_id, event, who, phone=None):
+def _log_lead_event(user_id, event, who, phone=None, attribution=None):
     """Запись в журнал заявок. Основное хранилище — Россия (15.10.2026):
     пишем в бакет, GitHub получает копию. Условная запись бакета защищает
     от гонки так же, как прежний ответ 409 у GitHub."""
@@ -1071,6 +1073,8 @@ def _log_lead_event(user_id, event, who, phone=None):
 
     def _изменить(data):
         rec = data.get(user_id, {})
+        if attribution is not None:
+            rec["attribution"] = attribution
         if phone:
             rec["phone"] = phone
         if event == "lead_created":
@@ -6107,6 +6111,12 @@ def site_lead():
     # группу заявок — только так их можно контролировать).
     data = {str(k).lower(): v for k, v in dict(сырые).items()}
 
+    # Probes exit before dedupe, counters, storage, or any send.
+    if is_test(data, data.get("phone", "")):
+        return _cors(jsonify(ok=True, test=True), origin)
+    attribution = sanitize_attribution(data)
+    attribution_note = attribution_text(attribution)
+
     # ловушка для роботов: поле спрятано от людей, заполняется только ботами
     if (data.get("company") or "").strip():
         return _cors(jsonify(ok=True), origin)
@@ -6131,21 +6141,12 @@ def site_lead():
     name = (data.get("name") or "").strip()[:60]
     when = datetime.now(MSK).strftime("%d.%m в %H:%M")
 
-    # Проверочные номера (+7 000 ...) в рабочую группу не идут: она для
-    # живых заявок, а не для наших тестов. Ответ форме при этом обычный,
-    # чтобы проверять всю цепочку целиком.
-    if digits[-10:].startswith("000"):
-        api("sendMessage", chat_id=FALLBACK_CHAT, parse_mode="HTML",
-            text=(f"🧪 <b>Тестовая заявка с сайта</b> (в группу не отправлена)\n"
-                  f"Телефон: <code>{phone}</code>\nСтраница: {page or '—'}\n{when}"))
-        return _cors(jsonify(ok=True, test=True), origin)
-
     text = (
         "🌐 <b>ЗАЯВКА С САЙТА</b>\n\n"
-        f"<b>Имя:</b> {name or 'не указано'}\n"
+        f"<b>Имя:</b> {_escape_html(name or 'не указано')}\n"
         f"<b>Телефон:</b> <code>{phone}</code>\n\n"
         f"<b>Подарок:</b> {подарок()}\n"
-        f"<b>Страница:</b> {page or 'не указана'}\n\n"
+        f"<b>Страница:</b> {_escape_html(page or 'не указана')}\n\n"
         # Раньше здесь всегда стояло «Форма на статье» — для заявки с
         # главной страницы это неправда и сбивает менеджера с толку.
         f"{'Форма на сайте' if data.get('formid') or data.get('formname') else 'Форма на статье'} · {when}"
@@ -6167,6 +6168,11 @@ def site_lead():
     метки["Comment"] = ("Заявка с сайта. "
                         + (f"Страница: {page}. " if page else "")
                         + f"Подарок: {подарок()}.")
+    original_comment = str(data.get("comment") or data.get("comments") or "")[:1200]
+    метки["Comment"] += ("\n\n" + original_comment if original_comment else "") + "\n\n" + attribution_note
+    text += "\n\n" + _escape_html(attribution_note[:1600])
+    if original_comment:
+        text += "\n\n" + _escape_html(original_comment)
     text += send_to_1c(user, phone, "keep", "any", f"страница: {page}", метки)
     # «Беру в работу» — как на карточках бота (правка Ольги 26.10.2026: без
     # этой кнопки не видно, кто взял заявку). У заявки с сайта свой id вида
@@ -6177,7 +6183,7 @@ def site_lead():
     # Заявка с сайта — в тот же журнал SLA, что и заявки бота. До 27.09.2026
     # журнал видел только Telegram-заявки (которых почти нет), поэтому
     # скорость первого контакта было не по чему считать.
-    log_lead_event(user["id"], "lead_created", phone=phone)
+    log_lead_event(user["id"], "lead_created", phone=phone, attribution=attribution)
     # Карточка уже в чате — отмечаем момент, по которому считаются напоминания
     # «заявка без ответа». Только если Телеграм действительно её принял.
     if (отправлено.get("result") or {}).get("message_id"):
@@ -6281,7 +6287,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-13-v101-test-anyway"
+VERSION = "2026-11-21-v102-attribution"
 
 
 @app.route("/health")
