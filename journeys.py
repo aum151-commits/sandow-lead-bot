@@ -104,11 +104,17 @@ def apply_journey(record, resolved, now=None):
     return record
 
 class JourneyRateLimiter:
-    """Bounded per-process 30/min global, 3/min per peer; salted peer hashes only."""
-    def __init__(self):
+    """Bounded per-process minute limiter; salted peer hashes only, no raw IPs kept.
+
+    A real site can send several legitimate bot taps per minute, so the defaults
+    are generous: a low ceiling here would silently turn journeys into unknown.
+    """
+    def __init__(self, per_minute=600, per_peer=20):
         self.lock = threading.Lock()
         self.salt = secrets.token_bytes(16)
-        self.events = deque(maxlen=30)
+        self.limit = per_minute
+        self.peer_limit = per_peer
+        self.events = deque(maxlen=per_minute)
         self.peers = {}
 
     def allow(self, peer, now=None):
@@ -118,7 +124,7 @@ class JourneyRateLimiter:
             while self.events and self.events[0] <= now - 60: self.events.popleft()
             self.peers = {k: deque(t for t in times if t > now - 60) for k, times in self.peers.items() if times and times[-1] > now - 60}
             times = self.peers.get(key, deque())
-            if len(self.events) >= 30 or len(times) >= 3: return False
+            if len(self.events) >= self.limit or len(times) >= self.peer_limit: return False
             self.events.append(now)
             times.append(now)
             self.peers[key] = times
