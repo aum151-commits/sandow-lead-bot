@@ -6263,6 +6263,18 @@ def _cors(resp, origin):
 
 
 _JOURNEY_RATE = JourneyRateLimiter()
+# Нажатия номера на сайте: только время и путь, ни телефона, ни имени.
+PHONE_CLICKS_PATH = "data/site_phone_clicks.json"
+
+
+def _неделя_не_прошла(метка: str) -> bool:
+    try:
+        момент = datetime.fromisoformat(str(метка).replace("Z", "+00:00"))
+        if момент.tzinfo is None:
+            момент = момент.replace(tzinfo=MSK)
+        return (datetime.now(MSK) - момент).days < 7
+    except (ValueError, TypeError):
+        return False
 
 
 def _save_journey_once(path, record, message):
@@ -6278,6 +6290,62 @@ def _save_journey_once(path, record, message):
         return result.status_code == 201
     except Exception:
         return False
+
+
+@app.route("/phone-click", methods=["POST", "OPTIONS"])
+def phone_click():
+    """Кто-то нажал номер на сайте. Телефона мы не знаем — сохраняем время и путь.
+
+    Нужно, потому что подменного номера у нас нет: связать звонок с посещением
+    можно только по времени нажатия. Записи живут неделю и обезличены.
+    """
+    origin = request.headers.get("Origin", "")
+    if origin not in JOURNEY_ORIGINS:
+        return jsonify(ok=False, error="origin"), 403
+
+    def response(payload, status=200):
+        resp = jsonify(payload)
+        resp.status_code = status
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp
+
+    if request.method == "OPTIONS":
+        return response({}, 204)
+    if request.content_length is not None and request.content_length > 8192:
+        return response({"ok": False, "error": "size"}, 413)
+    raw = request.stream.read(8193)
+    if len(raw) > 8192:
+        return response({"ok": False, "error": "size"}, 413)
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return response({"ok": False, "error": "json"}, 400)
+    if not isinstance(data, dict) or is_test(data):
+        return response({"ok": True, "test": True})
+    if not _JOURNEY_RATE.allow(request.remote_addr):
+        return response({"ok": False, "error": "rate"}, 429)
+    attribution = sanitize_attribution(data)
+    page = attribution.get("first_landing")
+    at = str(data.get("at", ""))[:32]
+    if not re.fullmatch(r"\d{4}-\d\d-\d\dT[\d:.+Z-]{5,20}", at):
+        at = datetime.now(MSK).isoformat()
+
+    def _сохранить(данные):
+        клики = [к for к in (данные.get("clicks") or []) if isinstance(к, dict)]
+        клики.append({"at": at, "page": str(data.get("page") or page or "")[:160],
+                      "attribution": attribution})
+        данные["clicks"] = [к for к in клики
+                            if _неделя_не_прошла(к.get("at"))][-2000:]
+        return True
+
+    try:
+        gh_update_json(PHONE_CLICKS_PATH, _сохранить, "сайт: нажатие номера (без телефона)")
+    except Exception:
+        return response({"ok": False, "error": "storage"}, 503)
+    return response({"ok": True})
 
 
 @app.route("/lead-journey", methods=["POST", "OPTIONS"])
