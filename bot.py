@@ -34,6 +34,8 @@ from urllib.parse import quote as _url_quote
 import requests
 from html import escape as _escape_html
 from attribution import sanitize_attribution, attribution_text, is_test
+from journeys import (ORIGINS as JOURNEY_ORIGINS, JourneyRateLimiter, create_journey,
+                      resolve_journey, subscriber_attribution, apply_journey, parse_payload)
 from flask import Flask, request, jsonify
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -1070,6 +1072,8 @@ def _log_lead_event(user_id, event, who, phone=None, attribution=None):
     пишем в бакет, GitHub получает копию. Условная запись бакета защищает
     от гонки так же, как прежний ответ 409 у GitHub."""
     now = datetime.now(MSK)
+    if attribution is None and event in ("lead_created", "card_sent") and not str(user_id).startswith("site-"):
+        attribution = _tg_attribution(user_id)
 
     def _изменить(data):
         rec = data.get(user_id, {})
@@ -2996,6 +3000,39 @@ def _save_subscriber(user, segment, phone, call_name=None, source=None):
         print(f"[base] {exc}", flush=True)
 
 
+def _has_evidence(attribution):
+    """Direct bot users keep the old card: no empty 'unknown' block is printed."""
+    return not all((attribution or {}).get(k, "unknown") in ("unknown", "")
+                   for k in ("first_source", "first_landing", "lead_id", "client_id"))
+
+
+def _tg_attribution(user_id):
+    # Persistent evidence survives STATE resets and service restarts.
+    try:
+        rec = (gh_read_json(GH_PATH, {}) or {}).get(str(user_id), {})
+        if rec.get("segment") in ("member", "trainer"):
+            return subscriber_attribution({})
+        return subscriber_attribution(rec)
+    except Exception:
+        return subscriber_attribution({})
+
+
+def _tg_save_journey(user_id, resolved, explicit=False):
+    if resolved is None and not explicit:
+        return
+    def mutate(data):
+        rec = data.setdefault(str(user_id), {})
+        if resolved is None:
+            rec.pop("attribution", None)
+            rec.pop("attribution_saved_at", None)
+        else:
+            apply_journey(rec, resolved)
+    try:
+        gh_update_json(GH_PATH, mutate, "tg: site attribution retained")
+    except Exception:
+        pass  # A storage failure must never prevent the normal conversation.
+
+
 # ---------------------------------------------------------------- шаги диалога
 
 def step_gate(chat_id, name, theme=None):
@@ -3627,6 +3664,9 @@ def finalize_booking(chat_id, message_id, user, st):
     ]
     if health:
         lines.append(f"<b>Особенности здоровья:</b> {health}")
+    booking_attribution = _tg_attribution(user.get("id"))
+    if _has_evidence(booking_attribution):
+        lines.append(_escape_html(attribution_text(booking_attribution)[:1600]))
 
     # Раздел 11 сценария (правка Ольги 29.09): ручной выбор тренера
     # координатором остаётся — но только как запасной путь, когда автоподбор
@@ -4462,6 +4502,10 @@ def send_to_1c(user, phone, goal, direction, source="", метки=None, fmt="")
     # и они перекрывают умолчания.
     if метки:
         data.update({k: v for k, v in метки.items() if v})
+    else:
+        one_c_attribution = _tg_attribution(user.get("id"))
+        if _has_evidence(one_c_attribution):
+            data["Comment"] += "\n\n" + attribution_text(one_c_attribution)
     try:
         r = requests.post(ONEC_WEBHOOK, data=data, timeout=25)
         if r.status_code == 200:
@@ -4526,6 +4570,9 @@ def send_lead(user, phone, goal, direction, source="", fmt=""):
         "Здоровье и время визита придут отдельным уточнением, как только "
         "клиент ответит."
     )
+    attribution = _tg_attribution(user.get("id"))
+    if _has_evidence(attribution):
+        text += "\n\n" + _escape_html(attribution_text(attribution)[:1600])
     text += send_to_1c(user, phone, goal, direction, source, fmt=fmt)
     r = send_to_orders(subject_chat_id=user.get("id"), text=text, parse_mode="HTML",
                         reply_markup=kb([[("Беру в работу", f"take:{user.get('id')}")]]))
@@ -5820,7 +5867,10 @@ def on_message(msg):
         archive_dialog(chat_id)
         # deep-link с лендинга: «/start boks» → тема разговора с первого слова
         parts = text.split(maxsplit=1)
-        theme = parts[1].strip().lower() if len(parts) > 1 else ""
+        payload = parts[1].strip() if len(parts) > 1 else ""
+        journey_token, legacy_fallback = parse_payload(payload)
+        journey = resolve_journey(journey_token, "telegram", gh_read_json) if journey_token else None
+        theme = (journey["legacy_start"] if journey else legacy_fallback) if journey_token else ("" if payload.lower().startswith("j_") else payload.lower())
         # Белый список: payload deep-link у Telegram и так ограничен
         # [A-Za-z0-9_-], но напечатанное руками «/start <b» ушло бы в
         # заявку как есть и сломало разбор HTML — заявка не дошла бы
@@ -5853,6 +5903,8 @@ def on_message(msg):
                       "звонить не нужно."))
             return step_member_menu(chat_id, greet=False)
 
+        # Member/trainer deep links above stay untouched. Store before resetting STATE.
+        _tg_save_journey(user.get("id"), journey, explicit=payload.lower().startswith("j_"))
         if theme not in LANDINGS:
             theme = None
         with LOCK:
@@ -6094,6 +6146,63 @@ def _cors(resp, origin):
     return resp
 
 
+_JOURNEY_RATE = JourneyRateLimiter()
+
+
+def _save_journey_once(path, record, message):
+    # A PUT without sha is create-only, unlike the general upsert adapter.
+    # Pointers contain no names/phones and must be shared with the MAX bot.
+    if not GH_TOKEN:
+        return False
+    body = {"message": message, "content": base64.b64encode(
+        json.dumps(record, ensure_ascii=False).encode("utf-8")).decode("ascii")}
+    try:
+        result = requests.put(f"https://api.github.com/repos/{GH_REPO}/contents/{path}",
+                              headers=_gh_headers(), json=body, timeout=8)
+        return result.status_code == 201
+    except Exception:
+        return False
+
+
+@app.route("/lead-journey", methods=["POST", "OPTIONS"])
+def lead_journey():
+    origin = request.headers.get("Origin", "")
+    if origin not in JOURNEY_ORIGINS:
+        return jsonify(ok=False, error="origin"), 403
+
+    def response(payload, status=200):
+        resp = jsonify(payload)
+        resp.status_code = status
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp
+
+    if request.method == "OPTIONS":
+        return response({}, 204)
+    if request.content_length is not None and request.content_length > 8192:
+        return response({"ok": False, "error": "size"}, 413)
+    raw = request.stream.read(8193)
+    if len(raw) > 8192:
+        return response({"ok": False, "error": "size"}, 413)
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return response({"ok": False, "error": "json"}, 400)
+    if not isinstance(data, dict):
+        return response({"ok": False, "error": "json"}, 400)
+    if is_test(data):
+        return response({"ok": True, "test": True})
+    # Do not trust caller-supplied forwarding headers for the per-peer limit.
+    if not _JOURNEY_RATE.allow(request.remote_addr):
+        return response({"ok": False, "error": "rate"}, 429)
+    result = create_journey(data, gh_read_json, _save_journey_once)
+    if result is None:
+        return response({"ok": False, "error": "journey"}, 503)
+    return response({"ok": True, **result})
+
+
 @app.route("/site-lead", methods=["POST", "OPTIONS"])
 def site_lead():
     origin = request.headers.get("Origin", "")
@@ -6287,7 +6396,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-21-v102-attribution"
+VERSION = "2026-11-21-v103-bot-journey"
 
 
 @app.route("/health")
