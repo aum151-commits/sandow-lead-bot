@@ -3226,6 +3226,63 @@ def step_goal(chat_id, message_id, intro=False):
         ]))
 
 
+def step_quick_offer(chat_id, message_id=None):
+    """Короткий вход нового человека: подарок и сразу кнопка номера.
+
+    22.11.2026, разбор воронки: до этой правки путь был «Хочу в клуб» →
+    «Что вам ближе?» (восемь кнопок) → ответ-ценность → и только потом
+    просьба о номере. Два экрана выбора стояли ДО просьбы, хотя обещание на
+    первом экране — «подберу время за минуту». Замер: из 138 кликов до бота
+    доходят 56, номер оставляют 31.
+
+    Направление здесь НЕ спрашиваем: спрашиваем его после номера (окно
+    step_dir_after_phone), где человек уже вложился и где ответ уточняет
+    заявку, а не задерживает её. Порядок «польза → номер → уточнения» —
+    то, что даёт номера у лид-ботов.
+
+    Старые кнопки (d:, g:, fmt:) остаются рабочими: у части людей в чатах
+    висят прошлые сообщения, и нажатие по ним не должно приводить к молчанию.
+    """
+    with LOCK:
+        st = STATE.setdefault(chat_id, {})
+        st["segment"] = "new"
+        st.setdefault("fmt", "training")
+        st.setdefault("dir", "any")
+    if message_id:
+        api("deleteMessage", chat_id=chat_id, message_id=message_id)
+    известный = lookup_phone(chat_id)
+    текст = (f"🎁 {офер_экран()}, а первая тренировка с тренером — бесплатная.\n\n"
+             "Оставьте, пожалуйста, номер — подберу удобное время и тренера "
+             "под вашу задачу. Позвоню или напишу здесь же, в этом чате.\n\n"
+             "Отправляя номер, вы соглашаетесь на обработку персональных данных.")
+    if известный:
+        return api("sendMessage", chat_id=chat_id, parse_mode="HTML", text=текст,
+                   reply_markup=kb([[("✅ Оставить номер " + известный, "ph:keep")]]))
+    return api("sendMessage", chat_id=chat_id, parse_mode="HTML", text=текст,
+               reply_markup=ASK_PHONE)
+
+
+def step_dir_after_phone(chat_id, fmt="training"):
+    """Направление — ПОСЛЕ номера, одним нажатием, без печати текста.
+
+    22.11.2026: здесь стоял вопрос о здоровье («спина, суставы, давление —
+    если нет, напишите „нет“»). Он требовал печатать текст сразу после того,
+    как человек отдал номер, и стоял ровно там, где кончается терпение:
+    медицина, личное, лишний экран. Убран из пути; в карточке менеджеру
+    остаётся напоминание уточнить это при звонке.
+    """
+    with LOCK:
+        STATE.setdefault(chat_id, {})["await_dir"] = True
+    return api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+               text="Спасибо! С чего начнёте? Подберу тренера под это.",
+               reply_markup=kb([
+                   [("Тренажёрный зал", "d2:gym")],
+                   [("Групповые программы", "d2:group")],
+                   [("Бокс и кикбоксинг", "d2:fight")],
+                   [("Ещё не решил — подберите сами", "d2:any")],
+               ]))
+
+
 def step_dir(chat_id, message_id, goal, intro=False):
     # Раздел 2.1 сценария (26.09, утверждено 27.09): вопрос о задаче
     # возвращён — но не как раньше (менеджер выясняет по звонку), а с
@@ -3530,7 +3587,11 @@ def step_time(chat_id, fmt, message_id=None, text=None):
     """
     with LOCK:
         st = STATE.setdefault(chat_id, {})
-        спросить = fmt == "training" and not st.get("sex_asked")
+        # 22.11.2026: вопрос «есть пожелание по тренеру?» снят с пути. Это был
+        # ещё один экран между номером и записью, а пожелание у большинства
+        # отсутствует — подбор идёт с «не важно». Оставили только явный выбор
+        # тренера, если человек сам его назовёт менеджеру.
+        спросить = False
         if спросить:
             st["sex_asked"] = True
     if спросить:
@@ -3549,6 +3610,40 @@ def step_time(chat_id, fmt, message_id=None, text=None):
         api("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
     else:
         api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
+
+
+def step_near_slots(chat_id, fmt, message_id=None):
+    """Три ближайших свободных часа — вместо семи дней на выбор.
+
+    22.11.2026, разбор воронки: после номера человек проходил «пол тренера»
+    → «какой день» → «какой час» → тренер. Три экрана, чтобы записаться.
+    Здесь — одна кнопка с готовым вариантом: «сегодня 19:00». Кто хочет
+    другое время, нажимает «Выбрать другой день» и попадает в прежний
+    календарь — прежний путь не сломан, он стал запасным.
+
+    Список строится теми же функциями, что и раньше (bookable_dates,
+    slots_on), поэтому окна тренеров и горизонт записи учитываются как есть.
+    """
+    варианты = []
+    for iso in bookable_dates(fmt, chat_id):
+        for t in slots_on(iso, fmt, chat_id):
+            варианты.append((iso, t))
+            if len(варианты) >= 3:
+                break
+        if len(варианты) >= 3:
+            break
+    if not варианты:
+        # Свободных часов в горизонте нет — ведём в прежний календарь,
+        # он сам объяснит, что выбрать другой день.
+        return step_time(chat_id, fmt, message_id=message_id)
+    rows = [[(f"{fmt_date_rel(iso).capitalize()} · {t}", f"sl:{fmt}:{iso}:{t}")]
+            for iso, t in варианты]
+    rows.append([("Выбрать другой день", f"tmore:{fmt}")])
+    текст = "Когда удобнее? Вот ближайшие свободные часы 👇"
+    if message_id:
+        return api("editMessageText", chat_id=chat_id, message_id=message_id,
+                   text=текст, reply_markup=kb(rows))
+    return api("sendMessage", chat_id=chat_id, text=текст, reply_markup=kb(rows))
 
 
 def step_slots(chat_id, message_id, iso, fmt):
@@ -3663,7 +3758,11 @@ def finalize_booking(chat_id, message_id, user, st):
         f"<b>Время:</b> {time_pref}",
     ]
     if health:
-        lines.append(f"<b>Особенности здоровья:</b> {health}")
+        lines.append(f"<b>Уточнить при звонке:</b> {health}")
+    elif fmt == "training":
+        # Вопрос о здоровье снят с пути клиента 22.11.2026 — напоминание
+        # менеджеру осталось: спросить самому при звонке.
+        lines.append("<b>Уточнить при звонке:</b> спина, суставы, давление")
     booking_attribution = _tg_attribution(user.get("id"))
     if _has_evidence(booking_attribution):
         lines.append(_escape_html(attribution_text(booking_attribution)[:1600]))
@@ -5546,7 +5645,7 @@ def on_button(cq):
         with LOCK:
             STATE.setdefault(chat_id, {})["segment"] = "new"
         save_subscriber(user, segment="new")
-        return step_dir(chat_id, mid, "", intro=True)
+        return step_quick_offer(chat_id, mid)
 
     if data == "seg:member":
         with LOCK:
@@ -5666,6 +5765,26 @@ def on_button(cq):
         with LOCK:
             STATE.setdefault(chat_id, {}).update({"dir": direction, "fmt": fmt})
         return step_phone(chat_id, mid, "", direction, fmt=fmt)
+
+    if data.startswith("d2:"):
+        # Направление, выбранное ПОСЛЕ номера (шаг step_dir_after_phone).
+        # Здесь же уточнение уходит второй заявкой в 1С по тому же телефону —
+        # сам бот привязывает по номеру (push_1c_followup).
+        direction = data.split(":", 1)[1]
+        with LOCK:
+            st = STATE.setdefault(chat_id, {})
+            st["dir"] = direction
+            st.pop("await_dir", None)
+            phone, fmt = st.get("phone"), st.get("fmt", "training")
+        if phone:
+            push_1c_followup(
+                phone,
+                f"Направление из бота: {DIRS.get(direction, DIRS['any'])[0]}",
+                chat_id=chat_id)
+        return step_near_slots(chat_id, fmt, message_id=mid)
+
+    if data.startswith("tmore:"):
+        return step_time(chat_id, data.split(":", 1)[1] or "training", message_id=mid)
 
     if data == "ph:keep":
         # «Оставить этот номер» — для тех, кто уже оставлял его раньше.
@@ -6121,10 +6240,7 @@ def finish(chat_id, user, phone):
             "goal": goal,
         }
     schedule_dropoff_watch(chat_id)
-    if fmt == "training":
-        ask_health(chat_id, user.get("first_name"))
-    else:
-        step_time(chat_id, fmt)
+    step_dir_after_phone(chat_id, fmt)
 
 
 # ── Заявка с сайта ──────────────────────────────────────────────────────────
@@ -6396,7 +6512,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-21-v104-bot-journey2"
+VERSION = "2026-11-22-v105-short-path"
 
 
 @app.route("/health")
