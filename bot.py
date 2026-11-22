@@ -3294,8 +3294,11 @@ def step_dir_after_phone(chat_id, fmt="training"):
         return direct_interests(chat_id) if fmt == "tour" else direct_goal(chat_id)
     # 22.11.2026: на втором экране обе кнопки сразу отправляют номер, поэтому
     # формат к этому моменту не выбран. Вопрос «с чего начнём?» не задаём —
-    # считаем тренировкой, а экскурсию человек выбирает прямо в списке задач
-    # строкой «Хочу сначала посмотреть клуб».
+    # считаем тренировкой (формат записываем, иначе выбор дня не примется), а
+    # экскурсию человек выбирает строкой «Хочу сначала посмотреть клуб».
+    fmt = fmt or "training"
+    with LOCK:
+        STATE.setdefault(chat_id, {}).update(fmt=fmt, direct_selected_format=True)
     return direct_interests(chat_id) if fmt == "tour" else direct_goal(chat_id)
 
 
@@ -6513,10 +6516,8 @@ def on_message(msg):
         if bridge_from_group(msg):
             return
 
-    # 22.11.2026: на втором экране выбор и кнопка номера живут в одной
-    # клавиатуре. Нажатие «Забронировать тренировку» или «Посмотреть зал» —
-    # это просто отметка выбора: бот молчит, потому что кнопка номера уже на
-    # экране. Никакого отдельного шага «Оставить номер» больше нет.
+    # 22.11.2026: обе кнопки второго экрана сами отправляют номер, поэтому текст
+    # от них в бота больше не приходит. Ветка оставлена для старых экранов.
     if (msg["chat"].get("type") == "private"
             and text in ("Забронировать тренировку", "Посмотреть зал")
             and STATE.get(chat_id, {}).get("direct_flow")):
@@ -6525,9 +6526,20 @@ def on_message(msg):
             st["fmt"] = "training" if text == "Забронировать тренировку" else "tour"
             st["direct_selected_format"] = True
             st["direct_stage"] = "offer"
-            st["phone_screen_shown"] = True
         direct_save(chat_id, "format_choice", st["fmt"])
         return
+
+    # 22.11.2026, жалоба Ольги: «пока я экран вверх и вниз провела, кнопки
+    # исчезли — нажимать не на что». Кнопка номера живёт в клавиатуре под полем
+    # ввода, и мессенджер её прячет (на компьютере и при крупном шрифте это
+    # обычное дело). Поэтому любое сообщение человека, пока номер не получен,
+    # возвращает тот же экран с кнопками: без упрёков и без новых вопросов.
+    if msg["chat"].get("type") == "private" and text and not msg.get("contact"):
+        состояние = STATE.get(chat_id, {})
+        if (состояние.get("direct_flow") and not состояние.get("phone")
+                and состояние.get("direct_stage") == "offer"
+                and not text.startswith("/") and not clean_phone(text)):
+            return step_quick_offer(chat_id)
 
     if msg.get("contact"):
         phone = clean_phone(msg["contact"].get("phone_number"))
@@ -7207,7 +7219,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v117-two-contact-buttons"
+VERSION = "2026-11-22-v119-buttons-come-back"
 
 
 @app.route("/health")
