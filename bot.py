@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Бот клуба «Сандов Фитнес» — единая точка входа с сайта.
 
@@ -3170,34 +3170,41 @@ def direct_message(chat_id, text, rows, message_id=None):
     return api("sendMessage", **kwargs)
 
 def step_gate(chat_id, name, theme=None):
+    """Первый экран. Текст и кнопки — правка Ольги 22.11.2026, дословно."""
     with LOCK:
         STATE.setdefault(chat_id, {})["direct_flow"] = True
     direct_save(chat_id, "start")
     return direct_message(chat_id,
-        "Здравствуйте 🙂 Это «Сандов Фитнес» на Нижегородской улице.\n\n"
-        "Хотите познакомиться с клубом или уже занимаетесь у нас?",
+        "<b>Ищете зал без очередей?</b>\n\n"
+        "Мы «Сандов Фитнес» на Нижегородской. У нас есть бесплатная тренировка с "
+        "планом в подарок. Хотите прийти на бесплатную тренировку или уже с нами?",
         [[("Хочу попробовать", "seg:new")], [("Уже занимаюсь", "seg:member")]])
 
 def step_quick_offer(chat_id, message_id=None):
+    """Второй экран. Текст и кнопки — правка Ольги 22.11.2026, дословно.
+
+    Порядок шагов изменился: раньше здесь сразу просили номер, а тренировку или
+    экскурсию человек выбирал уже после номера. Теперь выбор стоит до номера —
+    двумя кнопками «Забронировать тренировку» и «Посмотреть зал». Номер
+    спрашивается сразу после нажатия, поэтому лишнего шага не появилось.
+    """
     with LOCK:
         st = STATE.setdefault(chat_id, {})
         st.update(segment="new", direct_flow=True, direct_stage="offer")
     direct_save(chat_id, "offer")
-    text = ("<b>Первая тренировка с тренером — бесплатно, план тренировок — в подарок.</b>\n\n"
-            "Хотите сначала осмотреться? Начните с экскурсии: тренажёрный зал 1100 м² без очередей, "
-            "бойцовский клуб 500 м², залы групповых программ и финская сауна.\n\n"
-            "Оставьте, пожалуйста, номер — дальше выберете тренировку или экскурсию "
-            "и удобное время прямо здесь, в чате 🙂\n\n"
-            "Можно написать номер сообщением.\n\n"
-            "Отправляя номер, вы соглашаетесь на обработку персональных данных. "
-            '<a href="https://sandowfitness.ru/policy">Политика конфиденциальности</a>.')
+    text = ("<b>Отличный выбор!</b> На первой тренировке тренер разберет вашу "
+            "технику и составит личный план. За это платить не нужно.\n\n"
+            "У нас просторный зал 1100 м², к снарядам не стоим. Посмотрите клуб "
+            "и решите сами.\n\n"
+            "Выберите удобный вариант:\n\n"
+            "<i>Отправляя контакт, вы соглашаетесь на обработку персональных данных.</i>")
     if message_id:
         api("deleteMessage", chat_id=chat_id, message_id=message_id)
-    known = lookup_phone(chat_id)
-    markup = kb([[("Использовать номер " + known, "ph:keep")],
-                 [("Указать другой номер", "dr:other_phone")]]) if known else ASK_PHONE
     return api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-               disable_web_page_preview=True, reply_markup=markup)
+               disable_web_page_preview=True,
+               reply_markup=kb([[("Забронировать тренировку", "dr:training")],
+                                [("Посмотреть зал", "dr:tour")]]))
+
 
 def direct_format(chat_id, message_id=None):
     with LOCK:
@@ -3242,7 +3249,7 @@ def direct_calendar(chat_id, message_id=None):
     direct_save(chat_id, "calendar")
     return step_time(chat_id, fmt, message_id=message_id,
                      text="Когда вам удобно познакомиться с клубом?" if fmt == "tour" else
-                          "Выберите, пожалуйста, удобный день.")
+                          "Выберите удобный день.")
 
 def step_dir_after_phone(chat_id, fmt="training"):
     st = STATE.get(chat_id, {})
@@ -3274,14 +3281,18 @@ def direct_button(chat_id, mid, user, data):
             st["phone"] = known
     if data == "dr:other_phone":
         return api("sendMessage", chat_id=chat_id,
-                   text="Пришлите, пожалуйста, другой номер сообщением или кнопкой ниже.", reply_markup=ASK_PHONE)
+                   text="Пришлите другой номер сообщением или кнопкой ниже.", reply_markup=ASK_PHONE)
     if data in ("dr:training", "dr:tour"):
         st["fmt"] = data.split(":")[1]
         st["direct_selected_format"] = True
         direct_save(chat_id, "format", st["fmt"])
         if not st.get("phone"):
-            return api("sendMessage", chat_id=chat_id,
-                text="Оставьте, пожалуйста, номер — дальше выберем день и время прямо здесь 🙂",
+            # Согласие стоит там, где человек действительно отправляет контакт.
+            return api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+                text=("Оставьте номер — сразу выберем день и время здесь, в чате 🙂\n\n"
+                      "<i>Отправляя контакт, вы соглашаетесь на обработку персональных "
+                      'данных.</i> <a href="https://sandowfitness.ru/policy">Политика '
+                      "конфиденциальности</a>."),
                 reply_markup=ASK_PHONE)
         return direct_interests(chat_id, mid) if st["fmt"] == "tour" else direct_goal(chat_id, mid)
     if data == "dr:resume":
@@ -7113,7 +7124,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v111-reply-to-client"
+VERSION = "2026-11-22-v112-first-screens"
 
 
 @app.route("/health")
