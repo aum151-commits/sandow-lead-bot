@@ -58,6 +58,10 @@ class DirectResponseTests(unittest.TestCase):
         msg = self.sent[-1][1]
         self.assertIn('экскурсию', msg['text'])
         self.assertIn('500 м²', msg['text'])
+        self.assertTrue(msg['text'].startswith('<b>Первая тренировка с тренером — бесплатно'))
+        self.assertIn('https://sandowfitness.ru/policy', msg['text'])
+        self.assertEqual(msg['parse_mode'], 'HTML')
+        self.assertTrue(msg['disable_web_page_preview'])
         self.assertTrue(msg['reply_markup']['keyboard'][0][0]['request_contact'])
     def test_phone_opens_format_not_group(self):
         self.state(direct_stage='offer')
