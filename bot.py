@@ -4706,7 +4706,8 @@ def bridge_on(chat_id, message_id=None, user=None):
             send_or_defer(_do_send)
         threading.Timer(1800, _remind, args=(1,)).start()
         # если человек не тапнет кнопку, а напишет прямо здесь — мост подхватит:
-        # сообщение уйдёт в группу заявок, менеджер ответит реплаем
+        # сообщение уйдёт карточкой в группу заявок, менеджер увидит его. Ответ
+        # реплаем в группе клиенту НЕ уходит (решение Ольги 09.11.2026).
         with LOCK:
             STATE.setdefault(chat_id, {})["bridge"] = True
         markup = kb_mixed([[("✍️ Написать", "url:" + MANAGER_TG_URL)]])
@@ -4720,7 +4721,7 @@ def bridge_on(chat_id, message_id=None, user=None):
 
     with LOCK:
         STATE.setdefault(chat_id, {})["bridge"] = True
-    text = "Пишите — передам менеджеру, ответ придёт прямо сюда."
+    text = f"Пишите — передам менеджеру. Если нужно срочно, позвоните: {PHONE}"
     markup = kb([[("Завершить разговор", "bridge_off")]])
     if message_id:
         api("editMessageText", chat_id=chat_id, message_id=message_id,
@@ -6038,7 +6039,7 @@ def on_button(cq):
         return api("editMessageText", chat_id=chat_id, message_id=mid,
                    text="Подготовим справку. Пришлите, пожалуйста, фото разворота "
                         "паспорта (2-я и 3-я страницы) — и передам в работу. "
-                        "Менеджер напишет здесь, когда справка будет готова.\n\n"
+                        "Когда справка будет готова, с вами свяжется менеджер.\n\n"
                         "Отправляя фото, вы соглашаетесь на обработку персональных данных.")
 
     if data == "locker":
@@ -6332,8 +6333,8 @@ def on_message(msg):
             api("sendPhoto", chat_id=ORDERS_CHAT, photo=file_id, parse_mode="HTML",
                 caption=photo_caption)
         return api("sendMessage", chat_id=chat_id,
-                   text="Фото получено, передала в работу. Менеджер напишет здесь, "
-                        "когда справка будет готова.")
+                   text="Фото получено, передала в работу. Когда справка будет готова, "
+                        "с вами свяжется менеджер.")
     if awaiting_tax_photo and text and not text.startswith("/"):
         return api("sendMessage", chat_id=chat_id,
                    text="Жду именно фото разворота паспорта (2-я и 3-я страницы) — "
@@ -6354,8 +6355,8 @@ def on_message(msg):
                  "в рабочей группе ему не уходят.\n"
                  f"#id{chat_id}")
         return api("sendMessage", chat_id=chat_id,
-                   text=f"Принято: заморозка — {text}. Менеджер подтвердит "
-                        "оформление здесь же.")
+                   text=f"Принято: заморозка — {text}. Оформление подтвердит менеджер — "
+                        "свяжется с вами по телефону.")
 
     if text.startswith("/start"):
         archive_dialog(chat_id)
@@ -6965,7 +6966,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v109-short-offer"
+VERSION = "2026-11-22-v110-no-group-reply"
 
 
 @app.route("/health")
