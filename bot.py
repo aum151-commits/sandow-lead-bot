@@ -995,6 +995,28 @@ def kb_mixed(rows):
     return {"inline_keyboard": out}
 
 
+ОФФЕР_КЛАВИАТУРА = {
+    # 22.11.2026, итог по кнопкам: Ольге нужен ОДИН шаг — нажал и номер ушёл.
+    # В Телеграме так умеет только кнопка клавиатуры с request_contact: нажатие
+    # сразу отправляет контакт, без подтверждений и окон.
+    #
+    # Мини-приложение (web_app + requestContact) пробовали — оно добавляет ДВА
+    # подтверждения («запустить приложение», «отправить номер»), то есть длиннее
+    # на шаг. Отказались.
+    #
+    # Ограничение: такая клавиатура живёт под полем ввода, и Телеграм на iPhone
+    # убирает её, когда человек листает ленту вверх; возвращается она, когда
+    # лента прокручена вниз или коснулись строки ввода. Поэтому бот дополнительно
+    # возвращает её на любое сообщение человека и никогда не снимает сам до
+    # получения номера.
+    "keyboard": [
+        [{"text": "Забронировать тренировку", "request_contact": True}],
+        [{"text": "Посмотреть зал", "request_contact": True}],
+    ],
+    "resize_keyboard": True,
+}
+
+
 ASK_PHONE = {
     "keyboard": [[{"text": "📱 Отправить мой номер", "request_contact": True}]],
     "resize_keyboard": True,
@@ -3215,36 +3237,27 @@ def step_quick_offer(chat_id, message_id=None):
     if message_id:
         api("deleteMessage", chat_id=chat_id, message_id=message_id)
     return api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-               disable_web_page_preview=True,
-               reply_markup={"inline_keyboard": [
-                   [{"text": "Забронировать тренировку",
-                     "web_app": {"url": адрес_страницы() + "/phone?fmt=training"}}],
-                   [{"text": "Посмотреть зал",
-                     "web_app": {"url": адрес_страницы() + "/phone?fmt=tour"}}]]})
+               disable_web_page_preview=True, reply_markup=ОФФЕР_КЛАВИАТУРА)
 
 
 def адрес_страницы():
-    """Адрес бота в интернете — для кнопок мини-приложения."""
+    """Адрес бота в интернете — оставлен для прежних кнопок мини-приложения."""
     return (os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
             or "https://sandow-lead-bot-standalone.onrender.com")
 
 
 def спросить_номер(chat_id):
-    """Запасной путь: просьба о номере, если кнопки выбора не сработали.
+    """Запасной путь: просьба о номере кнопкой контакта.
 
-    Основной путь — кнопки выбора на втором экране открывают мини-приложение,
-    которое сразу запрашивает номер (одно нажатие). Сюда попадаем, только если
-    человек нажал старую кнопку из прежнего сообщения или мини-приложение не
-    открылось. Клавиатуры под полем ввода нет — только кнопка в сообщении.
+    Нужен, только если человек нажал старую кнопку из прежнего сообщения.
+    Обычный путь — кнопки второго экрана, которые сразу отправляют номер.
     """
     with LOCK:
         STATE.setdefault(chat_id, {})["phone_screen_shown"] = True
     return api("sendMessage", chat_id=chat_id, parse_mode="HTML",
                text=("Пришлите номер — и подберём время.\n"
                      "Нажмите кнопку ниже или просто напишите номер сообщением."),
-               reply_markup={"inline_keyboard": [[
-                   {"text": "📱 Отправить мой номер",
-                    "web_app": {"url": адрес_страницы() + "/phone"}}]]})
+               reply_markup=ASK_PHONE)
 
 
 def direct_format(chat_id, message_id=None):
@@ -7339,7 +7352,7 @@ def cron_tick(secret):
 </html>"""
 
 
-VERSION = "2026-11-22-v123-button-takes-phone"
+VERSION = "2026-11-22-v124-one-tap"
 
 
 @app.route("/phone")
