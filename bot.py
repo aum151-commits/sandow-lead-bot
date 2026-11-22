@@ -3298,9 +3298,17 @@ def direct_button(chat_id, mid, user, data):
         st["direct_selected_format"] = True
         direct_save(chat_id, "format", st["fmt"])
         if not st.get("phone"):
-            # 22.11.2026, правка Ольги: «без дополнительных вопросов». Тот же
-            # экран перерисовывается с кнопкой номера: старый удаляем, новый —
-            # тот же текст, только вместо кнопок выбора кнопка контакта.
+            # 22.11.2026, правка Ольги: «без дополнительных вопросов», а затем
+            # «всё равно второй раз просит оставить номер». Второй раз он и
+            # появлялся, когда человек нажимал кнопку ещё раз (или нажимал
+            # старый экран, который ещё не успел убраться): бот заново присылал
+            # тот же экран с кнопкой номера. Теперь экран показывается один раз:
+            # повторное нажатие ничего не дублирует.
+            with LOCK:
+                уже_показан = st.get("phone_screen_shown")
+                st["phone_screen_shown"] = True
+            if уже_показан:
+                return
             if mid:
                 api("deleteMessage", chat_id=chat_id, message_id=mid)
             return api("sendMessage", chat_id=chat_id, parse_mode="HTML",
@@ -6746,9 +6754,18 @@ def finish(chat_id, user, phone):
         return api("sendMessage", chat_id=chat_id,
                    text="Ваш выбор уже сохранён. Для изменения записи напишите сюда. Начать заново можно через /start 🙂")
     if not phone:
+        # 22.11.2026: вместо «не разобрал номер» повторяем тот же экран с кнопкой
+        # контакта — человек не должен читать упрёк и просить номер заново.
+        restored = direct_restore(chat_id)
+        if restored.get("direct_flow") and not restored.get("phone"):
+            api("sendMessage", chat_id=chat_id, parse_mode="HTML",
+                disable_web_page_preview=True,
+                text=ОФФЕР_ТЕКСТ + " <a href=\"https://sandowfitness.ru/policy\">"
+                                   "Политика конфиденциальности</a>.",
+                reply_markup=ASK_PHONE)
+            return
         return api("sendMessage", chat_id=chat_id,
-                   text="Не разобрал номер. Пришлите, пожалуйста, в формате "
-                        "+7 999 123-45-67.")
+                   text="Не разобрал номер. Пришлите номер в формате +7 999 123-45-67.")
 
     # член клуба делится номером для связи — это не заявка: в 1С не шлём,
     # менеджеров не дёргаем, просто запоминаем в базе
@@ -7138,7 +7155,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v114-one-screen"
+VERSION = "2026-11-22-v115-no-second-ask"
 
 
 @app.route("/health")
