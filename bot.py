@@ -128,6 +128,7 @@ S3_ОСВЕЖИТЬ = ("data/tg_subscribers.json", "data/lead_response_log.json"
 # Россию идёт копия; их переключение делается отдельным заходом, по одному
 # писателю за раз, потому что каждый — боевой.
 БОТ_ПИШЕТ_САМ = (
+    "data/tg_funnel.json",
     "data/tg_subscribers.json",
     "data/lead_response_log.json",
     "data/site_leads_by_day.json",
@@ -165,6 +166,7 @@ S3_ОСВЕЖИТЬ = ("data/tg_subscribers.json", "data/lead_response_log.json"
 # прошла — пишем, и это осознанно. Данные дороже схемы: лучше лишняя копия в
 # США на время сбоя, чем потерянная заявка.
 ПОЛНОСТЬЮ_В_РОССИИ = (
+    "data/tg_funnel.json",
     "data/lead_response_log.json",
     # База подписчиков: 66 человек, у части — телефон и настоящее имя.
     # Сюда же 16.10.2026, вторым заходом (Ольга: «Да, идём дальше: следующий
@@ -1543,7 +1545,7 @@ def _ход_отдан(имя):
     _QUEUE["порядок"] = None            # кэш сбрасываем, следующий ход возьмёт свежий
 
 
-def разбор_подбора(goal, direction, health, кроме=()):
+def разбор_подбора(goal, direction, health, кроме=(), strict_goal=False):
     """Кто вообще подходит под задачу — без учёта времени и пола.
 
     Отделено от выбора специально: этот список нужен и в отчёте координатору
@@ -1576,7 +1578,10 @@ def разбор_подбора(goal, direction, health, кроме=()):
         if нужно_здоровье and not set(нужно_здоровье) <= ком:
             continue
         жёстко.append(имя)
-    if по_направлению or not по_цели:
+    if strict_goal and direction != "fight" and по_цели:
+        годные = [и for и in жёстко
+                  if set((карта.get(и) or {}).get("компетенции") or []) & set(по_цели)]
+    elif по_направлению or not по_цели:
         годные = жёстко
     else:
         годные = [и for и in жёстко
@@ -1588,7 +1593,7 @@ def разбор_подбора(goal, direction, health, кроме=()):
 
 
 def авто_тренер(goal, direction, health, visit_date=None, visit_slot=None,
-                пол="any", кроме=()):
+                пол="any", кроме=(), strict_goal=False):
     """Кого поставить на запись. Возвращает разбор, а не только имя: причина
     отказа идёт в отчёт координатору, иначе провисание нельзя объяснить.
 
@@ -1597,7 +1602,7 @@ def авто_тренер(goal, direction, health, visit_date=None, visit_slot=N
     клиента, а не решает сам); «нет_окон» — подходящие есть, но на это время
     никто не открыл окна.
     """
-    годные, разбор = разбор_подбора(goal, direction, health, кроме)
+    годные, разбор = разбор_подбора(goal, direction, health, кроме, strict_goal=strict_goal)
     итог = {"тренер": None, "причина": "", "альтернативы": [], "разбор": разбор,
             "годные": годные}
     if not годные:
@@ -1982,67 +1987,149 @@ def _mark_daily_sent(key, value):
     gh_update_json(BOT_STATE_PATH, lambda d: d.__setitem__(key, value), f"daily-mark {key} {value}")
 
 
-def send_24h_followups():
-    """Раньше — followup_24h.yml (sandow-lp, cron раз в час). Перенесено
-    внутрь бота 30.09.2026 по просьбе Ольги: работа не должна зависеть от
-    GitHub Actions вообще (у schedule-триггера доказанные многочасовые
-    пропуски, см. ЗАДАЧИ-ХВОСТ.md) — бот и так живёт непрерывно (self-ping).
-    Логика 1:1 с прежним workflow, включая безопасную от гонки запись
-    флага (тот же gh_update_json, что и у окон тренеров)."""
-    now = datetime.now(MSK)
-    data = gh_read_json(GH_PATH, default={}) or {}
-    to_process = []
-    for chat_id, rec in data.items():
-        if rec.get("segment") != "new" or rec.get("phone") or rec.get("followed_up_24h"):
-            continue
-        first_seen = rec.get("first_seen")
-        if not first_seen:
-            continue
-        try:
-            seen_at = datetime.strptime(first_seen, "%Y-%m-%d %H:%M").replace(tzinfo=MSK)
-        except ValueError:
-            continue
-        if (now - seen_at).total_seconds() / 3600 < 24:
-            continue
-        to_process.append((chat_id, rec.get("name") or rec.get("call_name") or ""))
+FUNNEL_PATH = "data/tg_funnel.json"
+_FUNNEL_KEYS = ("direct_flow", "direct_stage", "direct_selected_format", "segment", "fmt",
+                "goal", "dir", "interests", "strict_goal", "visit_date", "visit_slot",
+                "time_pref", "booking_mid", "await_dir", "has_phone",
+                "confirmed", "completed", "stopped", "pending_booking", "bridge")
 
-    if not to_process:
+
+def funnel_event(chat_id, event, value=None, state=None):
+    """Return persisted record with nested state, or None; no phone/name stored."""
+    cid, state = str(chat_id), state or {}
+    if is_live_test(cid) or телефон_теста(state.get("phone")):
+        def mark_test(data):
+            if cid in data:
+                data[cid]["test"] = True
+                data[cid]["closed"] = "test"
+        try:
+            gh_update_json(FUNNEL_PATH, mark_test, "tg funnel test excluded")
+        except Exception:
+            pass
+        return None
+    allowed = ("start", "offer", "phone", "format", "goal", "direction", "interests",
+               "date", "time", "confirmed", "completed", "stopped", "stop", "member", "followup", "followup_failed",
+               "booking", "format_shown", "goal_shown", "direction_shown", "interests_shown", "calendar")
+    if event not in allowed:
+        return None
+    snapshot = {k: state[k] for k in _FUNNEL_KEYS if k in state}
+    if "phone" in state:
+        snapshot["has_phone"] = bool(state["phone"])
+    if event == "phone":
+        snapshot["has_phone"] = True
+    safe = False
+    if isinstance(value, str):
+        if event in ("format", "goal", "direction"):
+            safe = value in ("training", "tour", "resume", "stop", "strength", "shape", "keep",
+                             "stress", "back", "kids", "teens", "unsure", "gym", "fight", "any")
+        elif event == "date":
+            safe = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value))
+        elif event == "time":
+            safe = bool(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value))
+        elif event == "interests":
+            safe = all(v in ("gym", "group", "sauna", "fight", "undecided") for v in value.split(","))
+    value = value if safe else None
+    now = datetime.now(MSK).isoformat()
+
+    def mutate(data):
+        rec = data.get(cid)
+        if not isinstance(rec, dict):
+            if state.get("direct_flow") is not True:
+                return
+            rec = {"v108": True, "created_at": now, "state": {}, "events": []}
+            data[cid] = rec
+        if rec.get("v108") is not True:
+            return
+        rec.setdefault("state", {}).update(snapshot)
+        events = rec.setdefault("events", [])
+        if not any(e.get("event") == event and e.get("value") == value for e in events):
+            entry = {"event": event, "at": now}
+            if value is not None:
+                entry["value"] = value
+            events.append(entry)
+        if event in ("confirmed", "completed", "stopped", "stop", "member", "booking"):
+            rec["closed"] = event
+        rec["updated_at"] = now
+    try:
+        saved = gh_update_json(FUNNEL_PATH, mutate, "tg funnel " + event)
+    except Exception as exc:
+        print(f"[funnel] persistence failed: {type(exc).__name__}", flush=True)
+        return None
+    return saved.get(cid) if isinstance(saved, dict) else None
+
+
+def _direct_followup_eligible(rec, subscriber, now):
+    if not isinstance(rec, dict) or rec.get("v108") is not True:
+        return False
+    state = rec.get("state", {})
+    if not any(e.get("event") == "offer" for e in rec.get("events", [])):
+        return False
+    if (state.get("direct_flow") is not True or state.get("segment") != "new" or
+            state.get("bridge") or rec.get("closed") or
+            rec.get("followup_claim") or rec.get("followed_up_24h") or
+            subscriber.get("followed_up_24h") or subscriber.get("bot_blocked") or
+            state.get("booking_mid") or state.get("pending_booking") or
+            any(state.get(k) for k in ("confirmed", "completed", "stopped")) or
+            state.get("segment") == "member" or
+            subscriber.get("segment") == "member" or
+            state.get("direct_stage") in ("confirmed", "completed", "stopped", "stop", "member", "bridge")):
+        return False
+    if any(e.get("event") in ("confirmed", "completed", "stopped", "stop", "member", "followup")
+           for e in rec.get("events", [])):
+        return False
+    try:
+        started = datetime.fromisoformat(rec["updated_at"])
+        return started.tzinfo is not None and now - started >= timedelta(hours=2)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def send_24h_followups():
+    """One durable two-hour reminder for new v108 flows, never historic users."""
+    if is_quiet():
         return
-    sent_ids = []
-    # 25.10.2026, просьба Ольги: «если клиент заблокировал бота — надо это
-    # как-то отключить». Кто заблокировал, тому писать нечего: раньше отправка
-    # отказывала, флаг «догнали» не ставился, и бот стучался снова каждый час
-    # (в журнале — «bot was blocked by the user» двадцать с лишним раз в сутки).
-    # Теперь такой клиент помечается, и второго стука не будет.
-    недоступные = {}
-    for chat_id, name in to_process:
-        hi = f"{name}, возвращаюсь к вам." if name else "Возвращаюсь к вам."
-        text = (f"{hi} Самый простой шаг — посмотреть клуб вживую: "
-                "20 минут, ни к чему не обязывает. Подобрать время?")
-        r = api("sendMessage", chat_id=int(chat_id), text=text,
-                reply_markup=kb([[("Подобрать время", "go")]]))
-        if r.get("ok"):
-            sent_ids.append(chat_id)
+    now = datetime.now(MSK)
+    funnel = gh_read_json(FUNNEL_PATH, default={}) or {}
+    subscribers = gh_read_json(GH_PATH, default={}) or {}
+    for cid, rec in funnel.items():
+        subscriber = subscribers.get(str(cid), {})
+        live_states = globals().get("STATE", {})
+        live = live_states.get(str(cid), live_states.get(int(cid), {}))
+        if (live.get("bridge") or live.get("direct_stage") == "bridge" or
+                is_live_test(cid) or телефон_теста(subscriber.get("phone")) or
+                not _direct_followup_eligible(rec, subscriber, now)):
+            continue
+        claim = __import__("uuid").uuid4().hex
+
+        def take(data, cid=cid, claim=claim):
+            current = data.get(cid)
+            if _direct_followup_eligible(current, subscriber, now):
+                current["followup_claim"] = claim
+                current["followup_claimed_at"] = now.isoformat()
+                current["followed_up_24h"] = True
+        # Retry-safe: no external side effects or mutable flags in the mutation.
+        try:
+            gh_update_json(FUNNEL_PATH, take, "tg funnel claim followup")
+            saved = gh_read_json(FUNNEL_PATH, default={}) or {}
+        except Exception:
+            continue
+        current = saved.get(cid, {}) if isinstance(saved, dict) else {}
+        if current.get("followup_claim") != claim:
+            continue
+        if current.get("state", {}).get("has_phone") or subscriber.get("phone"):
+            text = "Продолжим запись? Выбор сохранили, заново отвечать не придётся 🙂"
+            buttons = [[("Продолжить запись", "dr:resume")], [("Больше не напоминать", "dr:stop")]]
         else:
-            причина = _клиент_недоступен(r)
-            if причина:
-                недоступные[chat_id] = причина
-    if sent_ids:
-        gh_update_json(GH_PATH,
-            lambda d, ids=sent_ids: [d[i].__setitem__("followed_up_24h", True) for i in ids if i in d],
-            f"tg-бот: догоняющее 24ч — {len(sent_ids)}")
-    if недоступные:
-        # Помечаем «догнали», чтобы не писать снова, и записываем причину в
-        # карточку: менеджер увидит, что человек закрыл боту вход — только звонок.
-        def _пометить(d, кого=недоступные):
-            for i, причина in кого.items():
-                if i in d:
-                    d[i]["followed_up_24h"] = True
-                    d[i]["bot_blocked"] = причина
-        gh_update_json(GH_PATH, _пометить,
-                       f"tg-бот: заблокировали бота — {len(недоступные)}")
-        for i, причина in недоступные.items():
-            print(f"[followup] {i}: {причина}", flush=True)
+            text = ("Хотите сначала посмотреть клуб или попробовать тренировку с тренером? "
+                    "Начать можно с любого варианта 🙂")
+            buttons = [[("Пробная тренировка", "dr:training")], [("Экскурсия", "dr:tour")],
+                       [("Больше не напоминать", "dr:stop")]]
+        try:
+            result = api("sendMessage", chat_id=int(cid), text=text, reply_markup=kb(buttons))
+        except Exception as exc:
+            result = {}
+            print(f"[direct-followup] send failed: {type(exc).__name__}", flush=True)
+        funnel_event(cid, "followup" if isinstance(result, dict) and result.get("ok") else "followup_failed")
 
 
 # ═══════════════════════════ напоминания о визите и контроль недозвона
@@ -3035,7 +3122,213 @@ def _tg_save_journey(user_id, resolved, explicit=False):
 
 # ---------------------------------------------------------------- шаги диалога
 
+DIRECT_GOALS = {
+    "strength": "Набрать форму и силу", "shape": "Снизить вес, подтянуть тело",
+    "keep": "Поддерживать форму", "stress": "Снять стресс, переключиться",
+    "back": "Здоровая спина", "kids": "Тренировки для ребёнка",
+    "teens": "Тренировки для подростка", "unsure": "Пока не знаю — нужна помощь",
+}
+DIRECT_INTERESTS = {"gym": "Тренажёрный зал", "group": "Залы групповых программ",
+                    "sauna": "Финская сауна", "fight": "Бокс и кикбоксинг"}
+
+def direct_save(chat_id, event, value=None):
+    with LOCK:
+        snapshot = dict(STATE.get(chat_id, {}))
+    return funnel_event(chat_id, event, value=value, state=snapshot)
+
+def direct_restore(chat_id):
+    if STATE.get(chat_id, {}).get("segment") == "member" or _segment(chat_id) == "member":
+        current = STATE.setdefault(chat_id, {})
+        current["segment"] = "member"
+        current["direct_flow"] = False
+        return current
+    if STATE.get(chat_id, {}).get("direct_flow"):
+        return STATE[chat_id]
+    try:
+        records = gh_read_json(FUNNEL_PATH, default={}) or {}
+    except Exception:
+        return STATE.get(chat_id, {})
+    snapshot = (records.get(str(chat_id)) or {}).get("state") or {}
+    if snapshot.get("direct_flow"):
+        with LOCK:
+            STATE.setdefault(chat_id, {}).update(snapshot)
+        if snapshot.get("has_phone"):
+            phone = lookup_phone(chat_id)
+            if phone:
+                STATE[chat_id]["phone"] = phone
+    return STATE.get(chat_id, {})
+
+def direct_message(chat_id, text, rows, message_id=None):
+    kwargs = dict(chat_id=chat_id, text=text, reply_markup=kb(rows))
+    if message_id:
+        return api("editMessageText", message_id=message_id, **kwargs)
+    return api("sendMessage", **kwargs)
+
 def step_gate(chat_id, name, theme=None):
+    with LOCK:
+        STATE.setdefault(chat_id, {})["direct_flow"] = True
+    direct_save(chat_id, "start")
+    return direct_message(chat_id,
+        "Здравствуйте 🙂 Это «Сандов Фитнес» на Нижегородской улице.\n\n"
+        "Хотите познакомиться с клубом или уже занимаетесь у нас?",
+        [[("Хочу попробовать", "seg:new")], [("Уже занимаюсь", "seg:member")]])
+
+def step_quick_offer(chat_id, message_id=None):
+    with LOCK:
+        st = STATE.setdefault(chat_id, {})
+        st.update(segment="new", direct_flow=True, direct_stage="offer")
+    direct_save(chat_id, "offer")
+    text = ("Попробовать тренировку или сначала посмотреть клуб? Выбирайте, как вам удобнее 🙂\n\n"
+            "Первое занятие с тренером — бесплатно, план тренировок — в подарок.\n\n"
+            "В клубе: тренажёрный зал 1100 м² без очередей, бойцовский клуб 500 м², "
+            "залы групповых программ и финская сауна.\n\n"
+            "Оставьте, пожалуйста, номер — дальше выберете тренировку или экскурсию "
+            "и удобное время. Подтверждение и адрес пришлём сюда.\n\n"
+            "Можно написать номер сообщением.\n\n"
+            "Отправляя номер, вы соглашаетесь на обработку персональных данных.")
+    if message_id:
+        api("deleteMessage", chat_id=chat_id, message_id=message_id)
+    known = lookup_phone(chat_id)
+    markup = kb([[("Использовать номер " + known, "ph:keep")],
+                 [("Указать другой номер", "dr:other_phone")]]) if known else ASK_PHONE
+    return api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
+
+def direct_format(chat_id, message_id=None):
+    with LOCK:
+        STATE.setdefault(chat_id, {})["direct_stage"] = "format"
+    direct_save(chat_id, "format_shown")
+    return direct_message(chat_id, "Спасибо! С чего начнём?",
+        [[("Тренировка с тренером", "dr:training")], [("Посмотреть клуб", "dr:tour")]], message_id)
+
+def direct_goal(chat_id, message_id=None):
+    with LOCK:
+        STATE.setdefault(chat_id, {})["direct_stage"] = "goal"
+    direct_save(chat_id, "goal_shown")
+    return direct_message(chat_id,
+        "Что для вас сейчас главное? По ответу подберём тренера, который работает с такими задачами.",
+        [[(label, "drg:" + code)] for code, label in DIRECT_GOALS.items()], message_id)
+
+def direct_direction(chat_id, message_id=None):
+    with LOCK:
+        STATE.setdefault(chat_id, {})["direct_stage"] = "direction"
+    direct_save(chat_id, "direction_shown")
+    return direct_message(chat_id, "Где хотите попробовать?",
+        [[("Тренажёрный зал", "drd:gym")], [("Бокс и кикбоксинг", "drd:fight")],
+         [("Пока не решил — помогите выбрать", "drd:any")]], message_id)
+
+def direct_interests(chat_id, message_id=None):
+    with LOCK:
+        st = STATE.setdefault(chat_id, {})
+        st["direct_stage"] = "interests"
+        selected = list(st.get("interests", []))
+    direct_save(chat_id, "interests_shown")
+    rows = [[(("✅ " if code in selected else "") + label, "dri:" + code)]
+            for code, label in DIRECT_INTERESTS.items()]
+    rows += [[("Выбрал — продолжить", "dri:done")], [("Пока не знаю — продолжить", "dri:skip")]]
+    return direct_message(chat_id,
+        "Что вам показать в первую очередь? Можно отметить несколько вариантов 🙂", rows, message_id)
+
+def direct_calendar(chat_id, message_id=None):
+    with LOCK:
+        st = STATE.setdefault(chat_id, {})
+        st["direct_stage"] = "date"
+        fmt = st.get("fmt", "training")
+    direct_save(chat_id, "calendar")
+    return step_time(chat_id, fmt, message_id=message_id,
+                     text="Когда вам удобно познакомиться с клубом?" if fmt == "tour" else
+                          "Выберите, пожалуйста, удобный день.")
+
+def step_dir_after_phone(chat_id, fmt="training"):
+    st = STATE.get(chat_id, {})
+    if not st.get("direct_flow"):
+        return _legacy_step_dir_after_phone(chat_id, fmt)
+    if st.get("direct_selected_format"):
+        return direct_interests(chat_id) if fmt == "tour" else direct_goal(chat_id)
+    return direct_format(chat_id)
+
+
+def direct_button(chat_id, mid, user, data):
+    st = direct_restore(chat_id)
+    if st.get("segment") == "member":
+        return step_member_menu(chat_id, mid)
+    if not st.get("direct_flow"):
+        return step_quick_offer(chat_id, mid)
+    if data == "dr:stop":
+        st["direct_stage"] = "stopped"
+        direct_save(chat_id, "stopped")
+        return direct_message(chat_id, "Хорошо. Если захотите познакомиться с клубом, напишите сюда 🙂", [], mid)
+    if st.get("direct_stage") == "stopped":
+        return api("sendMessage", chat_id=chat_id, text="Если захотите вернуться, нажмите /start 🙂")
+    if st.get("direct_stage") == "confirmed" or st.get("booking_mid"):
+        return api("sendMessage", chat_id=chat_id,
+                   text="Ваша запись уже сохранена. Если хотите её изменить, напишите сюда 🙂")
+    if not st.get("phone"):
+        known = lookup_phone(chat_id)
+        if known and st.get("has_phone"):
+            st["phone"] = known
+    if data == "dr:other_phone":
+        return api("sendMessage", chat_id=chat_id,
+                   text="Пришлите, пожалуйста, другой номер сообщением или кнопкой ниже.", reply_markup=ASK_PHONE)
+    if data in ("dr:training", "dr:tour"):
+        st["fmt"] = data.split(":")[1]
+        st["direct_selected_format"] = True
+        direct_save(chat_id, "format", st["fmt"])
+        if not st.get("phone"):
+            return api("sendMessage", chat_id=chat_id,
+                text="Оставьте, пожалуйста, номер — дальше выберем день и время прямо здесь 🙂",
+                reply_markup=ASK_PHONE)
+        return direct_interests(chat_id, mid) if st["fmt"] == "tour" else direct_goal(chat_id, mid)
+    if data == "dr:resume":
+        stage = st.get("direct_stage")
+        if not st.get("phone"):
+            return step_quick_offer(chat_id, mid)
+        if stage == "goal":
+            return direct_goal(chat_id, mid)
+        if stage == "direction":
+            return direct_direction(chat_id, mid)
+        if stage == "interests":
+            return direct_interests(chat_id, mid)
+        if stage in ("date", "time"):
+            return direct_calendar(chat_id, mid)
+        return direct_format(chat_id, mid)
+    if not st.get("phone"):
+        return step_quick_offer(chat_id, mid)
+    if data.startswith("drg:"):
+        goal = data.split(":", 1)[1]
+        if goal not in DIRECT_GOALS:
+            return direct_goal(chat_id, mid)
+        st["goal"] = goal
+        st["strict_goal"] = True
+        direct_save(chat_id, "goal", goal)
+        if goal in СВОИ_ЦЕЛИ:
+            st["dir"] = СВОИ_ЦЕЛИ[goal]
+            return direct_calendar(chat_id, mid)
+        return direct_direction(chat_id, mid)
+    if data.startswith("drd:"):
+        direction = data.split(":", 1)[1]
+        if direction not in ("gym", "fight", "any"):
+            return direct_direction(chat_id, mid)
+        st["dir"] = direction
+        direct_save(chat_id, "direction", direction)
+        return direct_calendar(chat_id, mid)
+    if data.startswith("dri:"):
+        interest = data.split(":", 1)[1]
+        if interest in ("done", "skip"):
+            if interest == "skip":
+                st["interests"] = []
+            direct_save(chat_id, "interests", ",".join(st.get("interests", [])) or "undecided")
+            return direct_calendar(chat_id, mid)
+        if interest in DIRECT_INTERESTS:
+            selected = list(st.get("interests", []))
+            if interest in selected:
+                selected.remove(interest)
+            else:
+                selected.append(interest)
+            st["interests"] = selected
+        return direct_interests(chat_id, mid)
+
+
+def _legacy_step_gate(chat_id, name, theme=None):
     """Развилка: бот обслуживает и новых людей, и действующих членов клуба.
 
     theme — код лендинга из deep-link (/start boks): первое сообщение
@@ -3231,7 +3524,7 @@ def step_goal(chat_id, message_id, intro=False):
         ]))
 
 
-def step_quick_offer(chat_id, message_id=None):
+def _legacy_step_quick_offer(chat_id, message_id=None):
     """Короткий вход нового человека: подарок и сразу кнопка номера.
 
     22.11.2026, разбор воронки: до этой правки путь был «Хочу в клуб» →
@@ -3276,7 +3569,7 @@ def step_quick_offer(chat_id, message_id=None):
                reply_markup=ASK_PHONE)
 
 
-def step_dir_after_phone(chat_id, fmt="training"):
+def _legacy_step_dir_after_phone(chat_id, fmt="training"):
     """Направление — ПОСЛЕ номера, одним нажатием, без печати текста.
 
     22.11.2026: здесь стоял вопрос о здоровье («спина, суставы, давление —
@@ -3735,7 +4028,8 @@ def finalize_booking(chat_id, message_id, user, st):
     visit_date, visit_slot = st.get("visit_date"), st.get("visit_slot")
     if fmt == "training":
         подбор = авто_тренер(st.get("goal", "keep"), direction, health,
-                             visit_date, visit_slot, st.get("trainer_sex", "any"))
+                             visit_date, visit_slot, st.get("trainer_sex", "any"),
+                             strict_goal=bool(st.get("direct_flow") and st.get("strict_goal")))
     else:
         подбор = {"тренер": None, "причина": "", "разбор": {}, "годные": [],
                   "альтернативы": []}
@@ -3764,6 +4058,12 @@ def finalize_booking(chat_id, message_id, user, st):
                             "на месте ответим на любые вопросы. Это займёт "
                             "двадцать минут и ни к чему не обязывает.\n\n"
                             f"Подтверждение пришлю сюда {when}.")
+        if st.get("direct_flow"):
+            greeting = (who_client + ", в") if who_client else "В"
+            client_text = (f"{greeting}ыбрали {time_pref}. " +
+                ("Подбираем тренера под вашу задачу.\n\nКак только запись подтвердится, напишем сюда. "
+                 "Повторно записываться не нужно 🙂" if fmt == "training" else
+                 "Проверим время встречи и напишем сюда 🙂"))
         if message_id:
             api("editMessageText", chat_id=chat_id, message_id=message_id, text=client_text)
         else:
@@ -3775,6 +4075,8 @@ def finalize_booking(chat_id, message_id, user, st):
         f"<b>Имя:</b> {name}",
         f"<b>Телефон:</b> <code>{phone or 'не оставлял'}</code>",
         f"<b>Направление:</b> {DIRS.get(direction, DIRS['any'])[0]}",
+        f"<b>Цель:</b> {DIRECT_GOALS.get(st.get('goal'), GOALS.get(st.get('goal'), 'Уточнить при встрече'))}",
+        f"<b>Интересы экскурсии:</b> {', '.join(DIRECT_INTERESTS.get(i, i) for i in st.get('interests', [])) or 'Пока не определился'}",
         f"<b>Время:</b> {time_pref}",
     ]
     if health:
@@ -3866,6 +4168,12 @@ def finalize_booking(chat_id, message_id, user, st):
             "visit_day": st.get("visit_day"), "visit_hour": st.get("visit_hour"),
             "visit_date": st.get("visit_date"), "visit_slot": st.get("visit_slot"),
         }
+    if st.get("direct_flow"):
+        with LOCK:
+            STATE[chat_id].update({k: st[k] for k in ("direct_flow", "strict_goal", "interests",
+                                                   "direct_selected_format") if k in st})
+            STATE[chat_id]["direct_stage"] = "pending"
+        direct_save(chat_id, "booking")
     extra = (f"Формат: {kind}. Время: {time_pref}."
              + (f" Особенности здоровья: {health}." if health else ""))
     if not is_live_test(chat_id):
@@ -4129,6 +4437,7 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who,
     этого параметра экскурсия после перезапуска подтвердилась бы как
     тренировка и клиент услышал бы про паспорт и фитнес-эксперта.
     """
+    direct_restore(target_chat_id)
     with LOCK:
         st = STATE.get(target_chat_id, {})
         fmt = st.get("fmt") or fmt or "training"
@@ -4179,6 +4488,21 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who,
                 "С собой — паспорт: он нужен для оформления визита.\n"
                 f"📍 Москва, {CLUB}. Маршрут: {maps_url}\n"
                 "Накануне напомню. Вопросы — пишите здесь, поможем 🙂")
+    if st.get("direct_flow") and not is_member:
+        greeting = f"{name}, ждём вас!" if name else "Ждём вас!"
+        if fmt == "training":
+            trainer_line = (f"Первую тренировку проведёт {trainer_name}. " if trainer_name else
+                            "Первую тренировку проведёт фитнес-эксперт. ")
+            text = (f"{greeting}\n{time_pref}\n\n{trainer_line}"
+                    "На встрече обсудите вашу задачу подробнее и начнёте тренировку.\n\n"
+                    "Возьмите, пожалуйста, спортивную форму, кроссовки и паспорт — "
+                    "по нему оформляют гостевой визит.\n\n"
+                    f"📍 Москва, {CLUB}. Маршрут: {maps_url}\n\nДо встречи на тренировке 🙂")
+        else:
+            text = (f"{greeting}\n{time_pref}\n\nВстретим и покажем клуб. "
+                    "Сможете спокойно осмотреться и задать вопросы.\n\n"
+                    "Возьмите, пожалуйста, паспорт — по нему оформляют визит.\n\n"
+                    f"📍 Москва, {CLUB}. Маршрут: {maps_url}\n\nБудем рады познакомиться 🙂")
     # Раздел 11 (правка 29.09): выбранный тренер — закрываем его слот в
     # календаре окон гостем и шлём ему карточку клиента с кнопками статуса
     # ДО сообщения клиенту «{тренер} уже знает о встрече» — иначе клиент
@@ -4221,12 +4545,18 @@ def coordinator_confirm(group_chat_id, message_id, target_chat_id, who,
                 card.append(f"<b>Телефон:</b> <code>{phone}</code>")
             if health:
                 card.append(f"<b>Особенности здоровья:</b> {health}")
+            if st.get("direct_flow"):
+                card.append("<b>Задача:</b> " + DIRECT_GOALS.get(st.get("goal"), "Уточнить на встрече"))
             card.append("\nПосле контакта с гостем отметьте статус:")
             api("sendMessage", chat_id=t_chat, parse_mode="HTML", text="\n".join(card),
                 reply_markup=kb([[("Связался, подтвердил", f"tstatus:{target_chat_id}:ok"),
                                    ("Перенёс", f"tstatus:{target_chat_id}:moved")]]))
 
-    api("sendMessage", chat_id=target_chat_id, text=text)
+    delivery = api("sendMessage", chat_id=target_chat_id, text=text)
+    if st.get("direct_flow") and delivery.get("ok"):
+        with LOCK:
+            STATE.setdefault(target_chat_id, {})["direct_stage"] = "confirmed"
+        direct_save(target_chat_id, "confirmed")
     who_name = who.get("first_name", "менеджер")
     confirmed_label = f"✅ Подтверждено: {who_name}" + (f" → {trainer_name}" if trainer_name else "")
     # При автоподборе карточку в группе бот отправляет сам и message_id у него
@@ -5497,6 +5827,9 @@ def on_button(cq):
                        text=f"Подтверждает тренировку координатор зала — {COORDINATOR_TG}")
     api("answerCallbackQuery", callback_query_id=cq["id"])
 
+    if data.startswith(("dr:", "drg:", "drd:", "dri:")):
+        return direct_button(chat_id, mid, user, data)
+
     if data.startswith("vconf:") or data.startswith("vshift:"):
         # Ответ на напоминание о визите: кнопка принадлежит тому чату, куда её
         # отправили, — чужие нажатия игнорируем.
@@ -5671,6 +6004,8 @@ def on_button(cq):
         with LOCK:
             STATE.setdefault(chat_id, {})["segment"] = "member"
         save_subscriber(user, segment="member")
+        if STATE.get(chat_id, {}).get("direct_flow"):
+            direct_save(chat_id, "member")
         return step_member_menu(chat_id, mid)
 
     if data == "bridge":
@@ -5820,7 +6155,17 @@ def on_button(cq):
         return finish(chat_id, user, известный)
 
     if data.startswith("tp:"):
+        st = direct_restore(chat_id)
         _, iso, fmt = data.split(":", 2)
+        if st.get("segment") == "member" and "member_training_already" not in st:
+            return step_member_menu(chat_id, mid)
+        if st.get("direct_flow"):
+            if st.get("booking_mid") or st.get("direct_stage") in ("confirmed", "pending", "stopped"):
+                return api("sendMessage", chat_id=chat_id, text="Для изменения записи напишите сюда. Чтобы начать заново, нажмите /start 🙂")
+            if fmt != st.get("fmt"):
+                return direct_calendar(chat_id, mid)
+            st["direct_stage"] = "time"
+            direct_save(chat_id, "date", iso)
         return step_slots(chat_id, mid, iso, fmt)
 
     if data.startswith("tsex:"):
@@ -5843,7 +6188,16 @@ def on_button(cq):
         return ответ_на_другой_пол(chat_id, mid, user, ответ == "да")
 
     if data.startswith("sl:"):
+        st = direct_restore(chat_id)
         _, fmt, iso, hhmm = data.split(":", 3)
+        if st.get("segment") == "member" and "member_training_already" not in st:
+            return step_member_menu(chat_id, mid)
+        if st.get("direct_flow"):
+            if st.get("booking_mid") or st.get("direct_stage") in ("confirmed", "pending", "stopped"):
+                return api("sendMessage", chat_id=chat_id, text="Запись уже сохранена. Если хотите её изменить, напишите сюда 🙂")
+            if fmt != st.get("fmt") or iso not in horizon_dates() or hhmm not in slots_on(iso, fmt, chat_id):
+                return direct_calendar(chat_id, mid)
+            direct_save(chat_id, "time", hhmm)
         return slot_chosen(chat_id, mid, user, fmt, iso, hhmm)
 
     if data.startswith("confirmvisit:"):
@@ -6212,6 +6566,11 @@ def on_message(msg):
 
 
 def finish(chat_id, user, phone):
+    restored = direct_restore(chat_id)
+    if restored.get("direct_flow") and (restored.get("booking_mid") or
+            restored.get("direct_stage") in ("confirmed", "pending", "stopped")):
+        return api("sendMessage", chat_id=chat_id,
+                   text="Ваш выбор уже сохранён. Для изменения записи напишите сюда. Начать заново можно через /start 🙂")
     if not phone:
         return api("sendMessage", chat_id=chat_id,
                    text="Не разобрал номер. Пришлите, пожалуйста, в формате "
@@ -6236,7 +6595,7 @@ def finish(chat_id, user, phone):
     goal, direction = st.get("goal", "keep"), st.get("dir", "any")
     fmt = st.get("fmt", "training")
     source = LANDINGS.get(st.get("src"), ("",))[0]
-    if too_soon(user.get("id")):
+    if too_soon(user.get("id")) and not st.get("direct_flow"):
         return api("sendMessage", chat_id=chat_id,
                    text="Ваш номер уже у нас — позвоним. "
                         f"Если срочно, наберите нас: {PHONE}",
@@ -6258,8 +6617,13 @@ def finish(chat_id, user, phone):
             # (16.10.2026): раньше она здесь терялась, и подбирать было не по
             # чему — осталось бы только «не важно».
             "goal": goal,
+            **({k: st[k] for k in ("direct_flow", "direct_stage", "direct_selected_format",
+                                  "strict_goal", "interests") if k in st}),
         }
-    schedule_dropoff_watch(chat_id)
+    if STATE.get(chat_id, {}).get("direct_flow"):
+        direct_save(chat_id, "phone")
+    else:
+        schedule_dropoff_watch(chat_id)
     step_dir_after_phone(chat_id, fmt)
 
 
@@ -6600,7 +6964,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v107-selling-texts"
+VERSION = "2026-11-22-v108-direct-response"
 
 
 @app.route("/health")
