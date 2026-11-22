@@ -3216,29 +3216,35 @@ def step_quick_offer(chat_id, message_id=None):
         api("deleteMessage", chat_id=chat_id, message_id=message_id)
     return api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
                disable_web_page_preview=True,
-               reply_markup=kb([[("Забронировать тренировку", "dr:training")],
-                                [("Посмотреть зал", "dr:tour")]]))
+               reply_markup={"inline_keyboard": [
+                   [{"text": "Забронировать тренировку",
+                     "web_app": {"url": адрес_страницы() + "/phone?fmt=training"}}],
+                   [{"text": "Посмотреть зал",
+                     "web_app": {"url": адрес_страницы() + "/phone?fmt=tour"}}]]})
+
+
+def адрес_страницы():
+    """Адрес бота в интернете — для кнопок мини-приложения."""
+    return (os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+            or "https://sandow-lead-bot-standalone.onrender.com")
 
 
 def спросить_номер(chat_id):
-    """Просьба о номере сразу после выбора. Только inline — без клавиатуры снизу.
+    """Запасной путь: просьба о номере, если кнопки выбора не сработали.
 
-    22.11.2026, требование Ольги: «не возвращай replyKeyboardMarkup, только
-    inline». Inline-кнопка в Телеграме не умеет запрашивать контакт напрямую,
-    поэтому кнопка открывает мини-приложение `/phone`, где одно нажатие
-    отправляет номер (Telegram.WebApp.requestContact). Рядом сказано, что можно
-    просто написать номер — этот путь работает всегда.
+    Основной путь — кнопки выбора на втором экране открывают мини-приложение,
+    которое сразу запрашивает номер (одно нажатие). Сюда попадаем, только если
+    человек нажал старую кнопку из прежнего сообщения или мини-приложение не
+    открылось. Клавиатуры под полем ввода нет — только кнопка в сообщении.
     """
     with LOCK:
         STATE.setdefault(chat_id, {})["phone_screen_shown"] = True
-    адрес = (os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-             or "https://sandow-lead-bot-standalone.onrender.com")
     return api("sendMessage", chat_id=chat_id, parse_mode="HTML",
                text=("Пришлите номер — и подберём время.\n"
                      "Нажмите кнопку ниже или просто напишите номер сообщением."),
                reply_markup={"inline_keyboard": [[
                    {"text": "📱 Отправить мой номер",
-                    "web_app": {"url": адрес + "/phone"}}]]})
+                    "web_app": {"url": адрес_страницы() + "/phone"}}]]})
 
 
 def direct_format(chat_id, message_id=None):
@@ -6528,12 +6534,30 @@ def on_message(msg):
     # ввода, и мессенджер её прячет (на компьютере и при крупном шрифте это
     # обычное дело). Поэтому любое сообщение человека, пока номер не получен,
     # возвращает тот же экран с кнопками: без упрёков и без новых вопросов.
+    # 22.11.2026: мини-приложение сообщает, какую кнопку нажали — «тренировка»
+    # или «зал». Приходит служебным сообщением после отправки номера.
+    данные_окна_ = msg.get("web_app_data") or {}
+    if данные_окна_.get("data"):
+        метка = str(данные_окна_["data"]).strip().lower()
+        if метка in ("training", "tour"):
+            with LOCK:
+                st = STATE.setdefault(chat_id, {})
+                st["fmt"] = метка
+                st["direct_selected_format"] = True
+                st["direct_flow"] = True
+                st.setdefault("direct_stage", "offer")
+            direct_save(chat_id, "format", метка)
+        return
+
+    # 22.11.2026: любое сообщение человека, пока номер не получен, возвращает
+    # экран с кнопками — на случай, если человек закрыл мини-приложение и не
+    # отправил номер. Без упрёков и без новых вопросов.
     if msg["chat"].get("type") == "private" and text and not msg.get("contact"):
         состояние = STATE.get(chat_id, {})
         if (состояние.get("direct_flow") and not состояние.get("phone")
                 and состояние.get("direct_stage") == "offer"
                 and not text.startswith("/") and not clean_phone(text)):
-            return спросить_номер(chat_id)
+            return step_quick_offer(chat_id)
 
     if msg.get("contact"):
         phone = clean_phone(msg["contact"].get("phone_number"))
@@ -7221,7 +7245,7 @@ def cron_tick(secret):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Сандов Фитнес — отправить номер</title>
+<title>Сандов Фитнес — номер</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root { color-scheme: light dark; }
@@ -7233,8 +7257,8 @@ def cron_tick(secret):
     color: var(--tg-theme-text-color, #111111);
   }
   .card { width: 100%; max-width: 420px; text-align: center; }
-  h1 { font-size: 22px; line-height: 1.3; margin: 0 0 12px; }
-  p { font-size: 16px; line-height: 1.5; margin: 0 0 24px; opacity: .75; }
+  h1 { font-size: 21px; line-height: 1.3; margin: 0 0 10px; }
+  p { font-size: 16px; line-height: 1.5; margin: 0 0 22px; opacity: .75; }
   button {
     width: 100%; padding: 18px 20px; font-size: 18px; font-weight: 600;
     border: 0; border-radius: 14px; cursor: pointer;
@@ -7242,52 +7266,80 @@ def cron_tick(secret):
     color: var(--tg-theme-button-text-color, #ffffff);
   }
   button:disabled { opacity: .6; cursor: default; }
-  .note { margin-top: 18px; font-size: 14px; line-height: 1.45; opacity: .6; }
-  .done { font-size: 17px; line-height: 1.5; }
+  .note { margin-top: 16px; font-size: 14px; line-height: 1.45; opacity: .65; }
 </style>
 </head>
 <body>
   <div class="card">
-    <h1>Отправьте номер — и подберём время</h1>
-    <p>Одно нажатие, номер увидит только клуб. Звонить без вашего согласия не будем.</p>
+    <h1 id="заголовок">Секунду — запрашиваю номер</h1>
+    <p id="подпись">Сейчас появится подтверждение от Телеграма. Это одно нажатие, дальше я всё сделаю сам.</p>
     <button id="send">Отправить мой номер</button>
-    <div class="note" id="note">Если кнопка не сработает — просто напишите номер в чате.</div>
+    <div class="note" id="note">Не получилось? Напишите номер прямо в чате — я приму его и продолжу.</div>
   </div>
 <script>
   var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
-  var кнопка = document.getElementById('send');
-  var заметка = document.getElementById('note');
-  if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+  var формат = "training";
+  try {
+    var параметры = new URLSearchParams(window.location.search);
+    if (параметры.get("fmt") === "tour") { формат = "tour"; }
+  } catch (e) {}
 
-  function готово() {
-    кнопка.disabled = true;
-    кнопка.textContent = 'Номер отправлен';
-    заметка.className = 'done';
-    заметка.textContent = 'Спасибо! Возвращайтесь в чат — я уже подбираю время.';
-    if (tg) { setTimeout(function () { try { tg.close(); } catch (e) {} }, 1200); }
+  var кнопка = document.getElementById('send');
+  var заголовок = document.getElementById('заголовок');
+  var подпись = document.getElementById('подпись');
+  var заметка = document.getElementById('note');
+  var отправлено = false;
+
+  function сказатьФормат() {
+    try { if (tg && typeof tg.sendData === 'function') { tg.sendData(формат); } } catch (e) {}
   }
 
-  кнопка.addEventListener('click', function () {
+  function готово() {
+    if (отправлено) { return; }
+    отправлено = true;
+    кнопка.disabled = true;
+    кнопка.style.display = 'none';
+    заголовок.textContent = 'Номер у меня';
+    подпись.textContent = 'Возвращайтесь в чат — я уже подбираю время и тренера.';
+    заметка.textContent = 'Если окно не закроется само, нажмите крестик.';
+    сказатьФормат();
+    if (tg) { setTimeout(function () { try { tg.close(); } catch (e) {} }, 1500); }
+  }
+
+  function запросить() {
     if (!tg || typeof tg.requestContact !== 'function') {
-      заметка.textContent = 'Напишите номер прямо в чате — я приму его и продолжу.';
+      заголовок.textContent = 'Напишите номер в чате';
+      подпись.textContent = 'Это окно не умеет запрашивать номер на вашем устройстве — просто напишите его сообщением.';
+      кнопка.style.display = 'none';
+      заметка.textContent = '';
       return;
     }
     try {
-      tg.requestContact(function (отправлено) {
-        if (отправлено) { готово(); }
-        else { заметка.textContent = 'Номер не отправлен. Нажмите ещё раз или напишите его в чате.'; }
+      tg.requestContact(function (ок) {
+        if (ок) { готово(); }
+        else {
+          заголовок.textContent = 'Номер не отправлен';
+          подпись.textContent = 'Нажмите кнопку ниже ещё раз или напишите номер в чате.';
+        }
       });
     } catch (e) {
-      заметка.textContent = 'Напишите номер прямо в чате — я приму его и продолжу.';
+      заголовок.textContent = 'Напишите номер в чате';
+      подпись.textContent = 'Просто отправьте номер сообщением — я приму его и продолжу.';
+      кнопка.style.display = 'none';
     }
-  });
+  }
+
+  if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+  кнопка.addEventListener('click', запросить);
+  // Главное: запрос номера стартует сам, сразу при открытии. Ольга просила,
+  // чтобы нажатие кнопки выбора сразу забирало номер, без второго шага.
+  setTimeout(запросить, 250);
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 
-VERSION = "2026-11-22-v122-phone-page-inside"
+VERSION = "2026-11-22-v123-button-takes-phone"
 
 
 @app.route("/phone")
