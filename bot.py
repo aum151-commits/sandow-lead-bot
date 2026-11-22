@@ -7213,7 +7213,81 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v121-inline-only-phone"
+# 22.11.2026: страница мини-приложения «отправить номер». Лежит прямо здесь,
+# а не отдельным файлом: выкладка бота загружает только bot.py, и отдельный
+# файл на сервере не появился — страница отдавала ошибку 500.
+СТРАНИЦА_НОМЕРА = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Сандов Фитнес — отправить номер</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center;
+    justify-content: center; padding: 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--tg-theme-bg-color, #ffffff);
+    color: var(--tg-theme-text-color, #111111);
+  }
+  .card { width: 100%; max-width: 420px; text-align: center; }
+  h1 { font-size: 22px; line-height: 1.3; margin: 0 0 12px; }
+  p { font-size: 16px; line-height: 1.5; margin: 0 0 24px; opacity: .75; }
+  button {
+    width: 100%; padding: 18px 20px; font-size: 18px; font-weight: 600;
+    border: 0; border-radius: 14px; cursor: pointer;
+    background: var(--tg-theme-button-color, #2f6bff);
+    color: var(--tg-theme-button-text-color, #ffffff);
+  }
+  button:disabled { opacity: .6; cursor: default; }
+  .note { margin-top: 18px; font-size: 14px; line-height: 1.45; opacity: .6; }
+  .done { font-size: 17px; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Отправьте номер — и подберём время</h1>
+    <p>Одно нажатие, номер увидит только клуб. Звонить без вашего согласия не будем.</p>
+    <button id="send">Отправить мой номер</button>
+    <div class="note" id="note">Если кнопка не сработает — просто напишите номер в чате.</div>
+  </div>
+<script>
+  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  var кнопка = document.getElementById('send');
+  var заметка = document.getElementById('note');
+  if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+
+  function готово() {
+    кнопка.disabled = true;
+    кнопка.textContent = 'Номер отправлен';
+    заметка.className = 'done';
+    заметка.textContent = 'Спасибо! Возвращайтесь в чат — я уже подбираю время.';
+    if (tg) { setTimeout(function () { try { tg.close(); } catch (e) {} }, 1200); }
+  }
+
+  кнопка.addEventListener('click', function () {
+    if (!tg || typeof tg.requestContact !== 'function') {
+      заметка.textContent = 'Напишите номер прямо в чате — я приму его и продолжу.';
+      return;
+    }
+    try {
+      tg.requestContact(function (отправлено) {
+        if (отправлено) { готово(); }
+        else { заметка.textContent = 'Номер не отправлен. Нажмите ещё раз или напишите его в чате.'; }
+      });
+    } catch (e) {
+      заметка.textContent = 'Напишите номер прямо в чате — я приму его и продолжу.';
+    }
+  });
+</script>
+</body>
+</html>
+"""
+
+
+VERSION = "2026-11-22-v122-phone-page-inside"
 
 
 @app.route("/phone")
@@ -7225,7 +7299,6 @@ def phone_page():
     решает обе беды: кнопка живёт в сообщении и открывает страницу с одним
     действием — отправить номер.
     """
-    from phone_page import СТРАНИЦА_НОМЕРА
     return Response(СТРАНИЦА_НОМЕРА, mimetype="text/html; charset=utf-8")
 
 
