@@ -3178,20 +3178,21 @@ def step_quick_offer(chat_id, message_id=None):
         st = STATE.setdefault(chat_id, {})
         st.update(segment="new", direct_flow=True, direct_stage="offer")
     direct_save(chat_id, "offer")
-    text = ("Попробовать тренировку или сначала посмотреть клуб? Выбирайте, как вам удобнее 🙂\n\n"
-            "Первое занятие с тренером — бесплатно, план тренировок — в подарок.\n\n"
-            "В клубе: тренажёрный зал 1100 м² без очередей, бойцовский клуб 500 м², "
-            "залы групповых программ и финская сауна.\n\n"
+    text = ("<b>Первая тренировка с тренером — бесплатно, план тренировок — в подарок.</b>\n\n"
+            "Хотите сначала осмотреться? Начните с экскурсии: тренажёрный зал 1100 м² без очередей, "
+            "бойцовский клуб 500 м², залы групповых программ и финская сауна.\n\n"
             "Оставьте, пожалуйста, номер — дальше выберете тренировку или экскурсию "
-            "и удобное время. Подтверждение и адрес пришлём сюда.\n\n"
+            "и удобное время прямо здесь, в чате 🙂\n\n"
             "Можно написать номер сообщением.\n\n"
-            "Отправляя номер, вы соглашаетесь на обработку персональных данных.")
+            "Отправляя номер, вы соглашаетесь на обработку персональных данных. "
+            '<a href="https://sandowfitness.ru/policy">Политика конфиденциальности</a>.')
     if message_id:
         api("deleteMessage", chat_id=chat_id, message_id=message_id)
     known = lookup_phone(chat_id)
     markup = kb([[("Использовать номер " + known, "ph:keep")],
                  [("Указать другой номер", "dr:other_phone")]]) if known else ASK_PHONE
-    return api("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
+    return api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+               disable_web_page_preview=True, reply_markup=markup)
 
 def direct_format(chat_id, message_id=None):
     with LOCK:
@@ -6964,7 +6965,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v108-direct-response"
+VERSION = "2026-11-22-v109-short-offer"
 
 
 @app.route("/health")
