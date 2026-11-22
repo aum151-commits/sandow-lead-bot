@@ -3164,7 +3164,13 @@ def direct_restore(chat_id):
     return STATE.get(chat_id, {})
 
 def direct_message(chat_id, text, rows, message_id=None):
-    kwargs = dict(chat_id=chat_id, text=text, reply_markup=kb(rows))
+    """Экран сценария. Разметка включена: без неё клиент видел «<b>…</b>» как
+    обычный текст прямо на первом экране (нашёл 22.11.2026 по вопросу Ольги
+    «что за кодировка на первом экране»). Текст этих экранов — наш, без имён от
+    клиента, поэтому разметка безопасна.
+    """
+    kwargs = dict(chat_id=chat_id, text=text, reply_markup=kb(rows),
+                  parse_mode="HTML", disable_web_page_preview=True)
     if message_id:
         return api("editMessageText", message_id=message_id, **kwargs)
     return api("sendMessage", **kwargs)
@@ -7124,7 +7130,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v112-first-screens"
+VERSION = "2026-11-22-v113-html-markup"
 
 
 @app.route("/health")
