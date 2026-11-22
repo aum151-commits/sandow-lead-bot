@@ -996,9 +996,17 @@ def kb_mixed(rows):
 
 
 ОФФЕР_КЛАВИАТУРА = {
+    # 22.11.2026, правка Ольги: «это одна и та же кнопка, а не отдельная на
+    # „оставить номер“». Обе кнопки второго экрана САМИ отправляют номер —
+    # отдельной кнопки контакта нет.
+    #
+    # Телеграм не сообщает, какую из двух нажали (в сообщении с контактом нет
+    # подписи кнопки), поэтому «тренировка или экскурсия» уточняется на
+    # следующем экране, где выбор и так есть, — пунктом «Хочу сначала
+    # посмотреть клуб». По умолчанию считаем тренировку.
     "keyboard": [
-        [{"text": "Забронировать тренировку"}, {"text": "Посмотреть зал"}],
-        [{"text": "📱 Отправить мой номер", "request_contact": True}],
+        [{"text": "Забронировать тренировку", "request_contact": True}],
+        [{"text": "Посмотреть зал", "request_contact": True}],
     ],
     "resize_keyboard": True,
 }
@@ -3239,9 +3247,14 @@ def direct_goal(chat_id, message_id=None):
     with LOCK:
         STATE.setdefault(chat_id, {})["direct_stage"] = "goal"
     direct_save(chat_id, "goal_shown")
+    rows = [[(label, "drg:" + code)] for code, label in DIRECT_GOALS.items()]
+    # 22.11.2026: кнопки второго экрана сами отправляют номер, поэтому «зал или
+    # тренировка» уточняется здесь — прямо в списке задач. Кому нужна экскурсия,
+    # нажимает эту строку, и путь идёт по экскурсии.
+    rows.append([("Хочу сначала посмотреть клуб", "drtour:1")])
     return direct_message(chat_id,
         "Что для вас сейчас главное? По ответу подберём тренера, который работает с такими задачами.",
-        [[(label, "drg:" + code)] for code, label in DIRECT_GOALS.items()], message_id)
+        rows, message_id)
 
 def direct_direction(chat_id, message_id=None):
     with LOCK:
@@ -3279,7 +3292,11 @@ def step_dir_after_phone(chat_id, fmt="training"):
         return _legacy_step_dir_after_phone(chat_id, fmt)
     if st.get("direct_selected_format"):
         return direct_interests(chat_id) if fmt == "tour" else direct_goal(chat_id)
-    return direct_format(chat_id)
+    # 22.11.2026: на втором экране обе кнопки сразу отправляют номер, поэтому
+    # формат к этому моменту не выбран. Вопрос «с чего начнём?» не задаём —
+    # считаем тренировкой, а экскурсию человек выбирает прямо в списке задач
+    # строкой «Хочу сначала посмотреть клуб».
+    return direct_interests(chat_id) if fmt == "tour" else direct_goal(chat_id)
 
 
 def direct_button(chat_id, mid, user, data):
@@ -3343,6 +3360,14 @@ def direct_button(chat_id, mid, user, data):
         return direct_format(chat_id, mid)
     if not st.get("phone"):
         return step_quick_offer(chat_id, mid)
+    if data.startswith("drtour:"):
+        # 22.11.2026: экскурсию человек выбирает уже после номера — на экране
+        # задачи, чтобы перед номером не было лишнего шага.
+        st["fmt"] = "tour"
+        st["direct_selected_format"] = True
+        st["goal"] = "keep"
+        direct_save(chat_id, "format", "tour")
+        return direct_interests(chat_id, mid)
     if data.startswith("drg:"):
         goal = data.split(":", 1)[1]
         if goal not in DIRECT_GOALS:
@@ -6007,7 +6032,7 @@ def on_button(cq):
         return api("editMessageText", chat_id=chat_id, message_id=mid,
                    text="Отменено — клиенту ничего не ушло.")
 
-    if data.startswith(("dr:", "drg:", "drd:", "dri:")):
+    if data.startswith(("dr:", "drg:", "drd:", "dri:", "drtour:")):
         return direct_button(chat_id, mid, user, data)
 
     if data.startswith("vconf:") or data.startswith("vshift:"):
@@ -7182,7 +7207,7 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v116-one-keyboard"
+VERSION = "2026-11-22-v117-two-contact-buttons"
 
 
 @app.route("/health")
