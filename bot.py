@@ -36,7 +36,7 @@ from html import escape as _escape_html
 from attribution import sanitize_attribution, attribution_text, is_test
 from journeys import (ORIGINS as JOURNEY_ORIGINS, JourneyRateLimiter, create_journey,
                       resolve_journey, subscriber_attribution, apply_journey, parse_payload)
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 ORDERS_CHAT = os.environ.get("ORDERS_CHAT_ID", "").strip()
@@ -3221,17 +3221,24 @@ def step_quick_offer(chat_id, message_id=None):
 
 
 def спросить_номер(chat_id):
-    """Просьба о номере сразу после выбора. Короткая: человек уже всё прочитал.
+    """Просьба о номере сразу после выбора. Только inline — без клавиатуры снизу.
 
-    Кнопка контакта — в клавиатуре под полем ввода (в Телеграме иначе нельзя),
-    и рядом сказано «или просто напишите» — на случай, когда клавиатуру спрятали.
+    22.11.2026, требование Ольги: «не возвращай replyKeyboardMarkup, только
+    inline». Inline-кнопка в Телеграме не умеет запрашивать контакт напрямую,
+    поэтому кнопка открывает мини-приложение `/phone`, где одно нажатие
+    отправляет номер (Telegram.WebApp.requestContact). Рядом сказано, что можно
+    просто написать номер — этот путь работает всегда.
     """
     with LOCK:
         STATE.setdefault(chat_id, {})["phone_screen_shown"] = True
+    адрес = (os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+             or "https://sandow-lead-bot-standalone.onrender.com")
     return api("sendMessage", chat_id=chat_id, parse_mode="HTML",
-               text=("Пришлите номер — и подберём время 👇\n"
-                     "Можно нажать кнопку ниже или просто написать номер сообщением."),
-               reply_markup=ASK_PHONE)
+               text=("Пришлите номер — и подберём время.\n"
+                     "Нажмите кнопку ниже или просто напишите номер сообщением."),
+               reply_markup={"inline_keyboard": [[
+                   {"text": "📱 Отправить мой номер",
+                    "web_app": {"url": адрес + "/phone"}}]]})
 
 
 def direct_format(chat_id, message_id=None):
@@ -7206,7 +7213,20 @@ def cron_tick(secret):
 # иногда не пересобирает сервис, а без панели управления это не проверить.
 # 25.10.2026: короткая отметка о доставке вместо реакции и отключение вечных
 # попыток писать тому, кто заблокировал бота.
-VERSION = "2026-11-22-v120-buttons-in-message"
+VERSION = "2026-11-22-v121-inline-only-phone"
+
+
+@app.route("/phone")
+def phone_page():
+    """Мини-приложение «отправить номер» — открывается по inline-кнопке.
+
+    Inline-кнопка в Телеграме не умеет запрашивать контакт напрямую, а
+    клавиатура под полем ввода на iPhone уезжает при прокрутке. Мини-приложение
+    решает обе беды: кнопка живёт в сообщении и открывает страницу с одним
+    действием — отправить номер.
+    """
+    from phone_page import СТРАНИЦА_НОМЕРА
+    return Response(СТРАНИЦА_НОМЕРА, mimetype="text/html; charset=utf-8")
 
 
 @app.route("/health")
