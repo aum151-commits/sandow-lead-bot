@@ -822,6 +822,31 @@ LANDINGS = {
     "klub": "макет в клубе",
 }
 
+# Входы ВНЕ сайта: ссылка лежит в сообществе, в канале, в визитке — и сама
+# называет себя. Нужно после разбора 24.11.2026: гостья из MAX пришла без
+# метки (не с сайта), и источник остался неизвестным. Тематического текста
+# здесь нет — это просто метка носителя, она пишется строкой «Источник».
+ВХОДЫ_ВНЕ_САЙТА = {
+    "soc": "сообщество или канал в MAX",
+    "kanal": "канал в Телеграме",
+    "vk": "ВКонтакте",
+    "avito": "Авито",
+    "vizitka": "визитка или QR-код",
+    "sotrud": "сотрудник клуба дал ссылку",
+}
+
+# Вопрос «как вы о нас узнали» — единственный способ узнать источник у тех,
+# кто пришёл в мессенджер напрямую: ни MAX, ни Телеграм не сообщают, откуда
+# человек взял бота. Спрашиваем ОДИН раз и только после записи, чтобы не
+# вставать поперёк пути к контакту.
+ИСТОЧНИКИ_СО_СЛОВ = {
+    "maps": "Яндекс.Карты",
+    "search": "поиск в интернете",
+    "social": "соцсети, канал",
+    "friends": "друзья, знакомые",
+    "nearby": "проходил рядом",
+}
+
 
 FALLBACK_CHAT = os.environ.get("FALLBACK_CHAT_ID", "220285486").strip()
 
@@ -3147,6 +3172,41 @@ def _tg_save_journey(user_id, resolved, explicit=False):
         pass  # A storage failure must never prevent the normal conversation.
 
 
+# ---------------------------------------------------- источник со слов гостя
+#
+# Зачем (24.11.2026). MAX и Телеграм не сообщают, откуда человек узнал о боте.
+# Если он не заходил на сайт, метка не ставится вовсе — так и осталась
+# «неизвестно» гостья Олеся, пришедшая в MAX 24.11. Единственный способ
+# узнать таких людей — спросить. Делаем это ОДИН раз и ТОЛЬКО после записи,
+# чтобы вопрос не вставал поперёк пути к контакту.
+
+def _источник_известен(chat_id):
+    """True — путь уже назван сайтом, кодом входа или прошлым ответом гостя."""
+    try:
+        rec = (gh_read_json(GH_PATH, {}) or {}).get(str(chat_id), {})
+    except Exception:
+        return False
+    if rec.get("source") or rec.get("source_last"):
+        return True
+    return _has_evidence(subscriber_attribution(rec))
+
+
+def спросить_источник(chat_id):
+    cid = str(chat_id)
+    if is_live_test(cid) or _источник_известен(cid):
+        return None
+    with LOCK:
+        st = STATE.setdefault(chat_id, {})
+        if st.get("source_asked") or (st.get("segment") or "") == "member":
+            return None
+        st["source_asked"] = True
+    rows = [[(label, "qsrc:" + code)] for code, label in ИСТОЧНИКИ_СО_СЛОВ.items()]
+    return api("sendMessage", chat_id=chat_id,
+               text="Один короткий вопрос, чтобы понимать, где нас находят: "
+                    "как вы о нас узнали? 🙂",
+               reply_markup=kb(rows))
+
+
 # ---------------------------------------------------------------- шаги диалога
 
 DIRECT_GOALS = {
@@ -4280,6 +4340,7 @@ def finalize_booking(chat_id, message_id, user, st):
                                st.get("goal", "keep"))
         отчёт_координатору(chat_id, тренер, итог, st.get("trainer_sex", "any"))
         подтвердить_автоподбор(chat_id, user, тренер, booking_mid)
+        спросить_источник(chat_id)
         return
 
     if fmt == "training" and подбор.get("причина") == "нужен_другой_пол":
@@ -4299,6 +4360,9 @@ def finalize_booking(chat_id, message_id, user, st):
                   f"<b>{предложен}</b>. Подскажите, пожалуйста, он вам подходит?"),
             reply_markup=kb([[("Да, подходит", "tsexok:да")],
                              [("Нужен другой тренер", "tsexok:нет")]]))
+        return спросить_источник(chat_id)
+
+    спросить_источник(chat_id)
 
 
 def итог_для_отчёта(chat_id, имя, телефон, время, подбор, goal=""):
@@ -6048,6 +6112,23 @@ def on_button(cq):
         return api("editMessageText", chat_id=chat_id, message_id=mid,
                    text="Отменено — клиенту ничего не ушло.")
 
+    if data.startswith("qsrc:"):
+        # Ответ гостя на «как вы о нас узнали?». Пишем в базу подписчика и
+        # отдельной строкой под карточкой записи — чтобы менеджер видел, каким
+        # носителем человек к нам пришёл, даже если пути с сайта нет.
+        метка = ИСТОЧНИКИ_СО_СЛОВ.get(data.split(":", 1)[1])
+        if not метка:
+            return
+        save_subscriber(user, source="со слов гостя: " + метка)
+        with LOCK:
+            карточка = STATE.get(chat_id, {}).get("booking_mid")
+        if карточка and not is_live_test(chat_id):
+            api("sendMessage", chat_id=ORDERS_CHAT, parse_mode="HTML",
+                text=f"🙋 Гость сам сказал, откуда о нас узнал: <b>{метка}</b>",
+                reply_to_message_id=карточка)
+        return api("editMessageText", chat_id=chat_id, message_id=mid,
+                   text="Спасибо! Увидимся в клубе 🙂")
+
     if data.startswith(("dr:", "drg:", "drd:", "dri:", "drtour:")):
         return direct_button(chat_id, mid, user, data)
 
@@ -6681,7 +6762,8 @@ def on_message(msg):
             STATE.pop(chat_id, None)
             if src:
                 STATE[chat_id] = {"src": src}
-        save_subscriber(user, source=(LANDINGS[theme][0] if theme in LANDINGS else src))
+        save_subscriber(user, source=(LANDINGS[theme][0] if theme in LANDINGS
+                                     else ВХОДЫ_ВНЕ_САЙТА.get(src, src)))
         return step_gate(chat_id, user.get("first_name"), theme=theme)
 
     if text.startswith("/help"):
@@ -7352,7 +7434,7 @@ def cron_tick(secret):
 </html>"""
 
 
-VERSION = "2026-11-22-v124-one-tap"
+VERSION = "2026-11-24-v125-source-question"
 
 
 @app.route("/phone")
