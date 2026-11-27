@@ -10,6 +10,19 @@ def is_test(data, phone=''):
     digits = re.sub(r'\D', '', str(phone))[-10:]
     return flag not in ('', '0', 'false', 'no', 'off', 'none') or digits.startswith(('900000', '000'))
 
+def is_suspicious_site_lead(data, phone=''):
+    """Quarantine explicit probe markers without banning real phone ranges."""
+    digits = re.sub(r'\D', '', str(phone))[-10:]
+    if digits in {'9001112233', '9990000000'}:
+        return True
+    markers = re.compile(r'\b(?:test|тест|проверка)\b', re.IGNORECASE)
+    return any(
+        markers.search(str(value or ''))
+        for key, value in data.items()
+        if str(key).lower() in {'name', 'comment', 'comments'}
+    )
+
+
 def sanitize_attribution(data):
     forbidden = [str(data.get(k, '')).strip().lower() for k in ('name', 'email', 'phone')]
     def safe(value, limit=80, term=False, status=False):

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Бот клуба «Сандов Фитнес» — единая точка входа с сайта.
 
@@ -33,7 +33,7 @@ from urllib.parse import quote as _url_quote
 
 import requests
 from html import escape as _escape_html
-from attribution import sanitize_attribution, attribution_text, is_test
+from attribution import sanitize_attribution, attribution_text, is_test, is_suspicious_site_lead
 from journeys import (ORIGINS as JOURNEY_ORIGINS, JourneyRateLimiter, create_journey,
                       resolve_journey, subscriber_attribution, apply_journey, parse_payload)
 from flask import Flask, request, jsonify, Response
@@ -7187,6 +7187,28 @@ def site_lead():
         return _cors(jsonify(ok=False, error="phone"), origin), 400
     phone = "+7" + digits[-10:]
 
+    # Quarantine before dedupe, accounting, storage, or production delivery.
+    # Never use send_to_orders here: its fallback policy targets work chats.
+    if is_suspicious_site_lead(data, phone):
+        quarantine_name = str(data.get("name") or "не указано")[:60]
+        quarantine_page = str(data.get("page") or data.get("formname")
+                              or data.get("referer") or "не указана")[:120]
+        quarantine_comment = str(data.get("comment") or data.get("comments")
+                                 or "не указан")[:1200]
+        quarantine_text = (
+            "<b>Подозрительная заявка — не передана отделу продаж</b>\n\n"
+            f"<b>Имя:</b> {_escape_html(quarantine_name)}\n"
+            f"<b>Телефон:</b> {_escape_html(phone)}\n"
+            f"<b>Страница:</b> {_escape_html(quarantine_page)}\n"
+            f"<b>Комментарий:</b> {_escape_html(quarantine_comment)}"
+        )
+        delivered = api("sendMessage", chat_id="220285486",
+                        text=quarantine_text, parse_mode="HTML")
+        if not (isinstance(delivered, dict) and delivered.get("ok") is True
+                and (delivered.get("result") or {}).get("message_id")):
+            return _cors(jsonify(ok=False, error="quarantine_delivery"), origin), 503
+        return _cors(jsonify(ok=True, quarantined=True), origin)
+
     # один и тот же номер дважды за десять минут — не тревожим менеджеров
     now = time.time()
     with _SITE_LOCK:
@@ -7449,7 +7471,7 @@ def cron_tick(secret):
 </html>"""
 
 
-VERSION = "2026-11-24-v126-landing-codes"
+VERSION = "2026-11-27-v127-site-quarantine"
 
 
 @app.route("/phone")
